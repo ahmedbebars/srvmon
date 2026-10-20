@@ -1,0 +1,10 @@
+[Unit]
+Description=srvmon agent (push metrics to the n8n Server Monitor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/srvmon-agent /etc/srvmon/agent.json
+Nice=10
+TimeoutStartSec=110

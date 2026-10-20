@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+tools/demo/node_modules/
+tools/demo/out/

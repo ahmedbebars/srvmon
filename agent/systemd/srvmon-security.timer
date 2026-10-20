@@ -1,0 +1,10 @@
+[Unit]
+Description=Send the srvmon security summary once a day
+
+[Timer]
+# Runs before n8n sends the digest at 09:10 (workflow time zone). Move it if that is earlier than 05:45 UTC.
+OnCalendar=*-*-* 05:45:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

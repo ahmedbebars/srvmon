@@ -1,0 +1,1223 @@
+{
+  "name": "Server Monitor (srvmon)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "srvmon/in/CHANGE-ME",
+        "options": {},
+        "responseMode": "onReceived"
+      },
+      "id": "4f1e2adc-f010-5849-8638-06bd9229e7bc",
+      "name": "Agent Report",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "4baae75d-81d1-5bb7-a492-af8caec28a58"
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_status"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "server",
+              "condition": "eq",
+              "keyValue": "={{ $json.body.server }}"
+            }
+          ]
+        },
+        "returnAll": false,
+        "limit": 1
+      },
+      "id": "33804618-2c54-5269-b2d0-a9ebfad8183d",
+      "name": "Load Previous State",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// srvmon · Evaluate Report\n// Compares one agent report with what the server looked like last time: what is new, what is\n// still open, what was fixed. A problem has to show up in `need` reports in a row before it\n// alerts, and it alerts once; when it goes away you get one \"resolved\" line with how long it lasted.\n\n// ---- settings ---------------------------------------------------------------------------\nvar LANG = 'en';  // 'en', or 'ar' for Egyptian Arabic\n// Only these servers may report. A leaked URL or a typo'd name is dropped instead of showing up as a new server.\nvar KNOWN = ['web-1', 'web-2', 'erp-1', 'shop-1'];\n// The agent attaches logs at the same disk/RAM/CPU levels (DISK_PCT, MEM_PCT, CPU_PCT in srvmon-agent).\nvar DISK_PCT = 85, MEM_PCT = 92, CPU_PCT = 95, SSL_DAYS = 14, ROUTER_CPU_PCT = 90;\n// -------------------------------------------------------------------------------------------\n\nvar T = {\n  en: {\n    disk: function (d) { return '💾 Disk ' + d.mount + ' at ' + d.pct + '% (' + d.used_gb + '/' + d.total_gb + 'G)'; },\n    mem: function (p) { return '🧠 RAM at ' + p + '%'; },\n    psi: function (p) { return '🧠 Memory pressure: tasks waited for RAM ' + p + '% of the last 5 minutes. Something is using too much, or the server needs more RAM'; },\n    cpu: function (p) { return '🔥 CPU at ' + p + '%'; },\n    unit: function (u) { return '⚙️ Service ' + u + ' failed'; },\n    unhealthy: function (c) { return '🐳 ' + c + ' unhealthy'; },\n    restarting: function (c) { return '🐳 ' + c + ' keeps restarting'; },\n    exited: function (c, x) { return '🐳 ' + c + ' stopped (exit ' + x + ')'; },\n    site: function (t, e) { return '🌐 ' + t + ' is down: ' + e; },\n    ssl: function (t, d) { return '🔒 Certificate for ' + t + ' expires in ' + d + ' days'; },\n    routerDown: function (e) { return '📡 The router does not answer: ' + e; },\n    wan: function (l, running, other) { return '🔌 ' + l + ' is down' + (running ? ' (the link is up, but no internet from the provider)' : ' (the port is unplugged)') + (other ? ' · running on ' + other : ' · ⚠️ no line is up'); },\n    port: function (p) { return '🔗 Router port ' + p + ' is down'; },\n    routerCpu: function (p) { return '🔥 Router CPU at ' + p + '%'; },\n    reboot: function (m) { return '🔄 The router restarted (up ' + m + ' min). If nobody did it by hand, it was most likely a power cut'; },\n    device: function (icon, name, since, nvr) { return icon + ' ' + name + ' is offline' + (since ? ' since ' + since : '') + (nvr ? ' (and every camera behind it)' : ''); },\n    noBackup: function (l) { return '💾 Backup ' + l + ': no copy found'; },\n    oldBackup: function (l, h, lim) { return '💾 Backup ' + l + ': the newest copy is ' + h + ' h old (expected every ' + lim + ' h)'; },\n    lasted: function (d) { return ' (lasted ' + d + ')'; },\n    added: '🆕 Added to monitoring',\n    back: function (d) { return '✅ Back online after ' + d; },\n    fixed: '✅ Resolved: ',\n    logs: 'logs',\n    min: function (m) { return m + ' min'; },\n    hours: function (h, m) { return h + ' h ' + m + ' min'; },\n    days: function (d) { return d + ' days'; }\n  },\n  ar: {\n    disk: function (d) { return '💾 الديسك ' + d.mount + ' وصل ' + d.pct + '% (' + d.used_gb + '/' + d.total_gb + 'G)'; },\n    mem: function (p) { return '🧠 الرام ' + p + '%'; },\n    psi: function (p) { return '🧠 السيرفر بيستنى الرام ' + p + '% من الوقت (آخر 5 دقايق) — حاجة بتاكل رام زيادة أو السيرفر محتاج رام أكتر'; },\n    cpu: function (p) { return '🔥 الـ CPU ' + p + '%'; },\n    unit: function (u) { return '⚙️ خدمة ' + u + ' واقعة (failed)'; },\n    unhealthy: function (c) { return '🐳 ' + c + ' unhealthy'; },\n    restarting: function (c) { return '🐳 ' + c + ' بيعمل restart متكرر'; },\n    exited: function (c, x) { return '🐳 ' + c + ' واقف (exit ' + x + ')'; },\n    site: function (t, e) { return '🌐 ' + t + ' مش شغال: ' + e; },\n    ssl: function (t, d) { return '🔒 شهادة ' + t + ' فاضلها ' + d + ' يوم'; },\n    routerDown: function (e) { return '📡 الراوتر مش بيرد على السيرفر: ' + e; },\n    wan: function (l, running, other) { return '🔌 ' + l + ' واقع' + (running ? ' (الكابل متوصل بس مفيش نت من الشركة)' : ' (البورت مفصول من الراوتر)') + (other ? ' · المحل شغال على ' + other : ' · ⚠️ مفيش ولا خط شغال'); },\n    port: function (p) { return '🔗 بورت ' + p + ' على الراوتر مفصول'; },\n    routerCpu: function (p) { return '🔥 الـ CPU بتاع الراوتر ' + p + '%'; },\n    reboot: function (m) { return '🔄 الراوتر عمل restart (شغال بقاله ' + m + ' دقيقة). لو محدش عمله بإيده يبقى غالباً الكهربا قطعت'; },\n    device: function (icon, name, since, nvr) { return icon + ' ' + name + ' مفصول' + (since ? ' من ' + since : '') + (nvr ? ' (وكل الكاميرات معاه)' : ''); },\n    noBackup: function (l) { return '💾 باك أب ' + l + ': مفيش ولا نسخة'; },\n    oldBackup: function (l, h, lim) { return '💾 باك أب ' + l + ' آخر نسخة من ' + h + ' ساعة (المفروض كل ' + lim + ' ساعة)'; },\n    lasted: function (d) { return ' (استمرت ' + d + ')'; },\n    added: '🆕 اتضاف للمراقبة',\n    back: function (d) { return '✅ رجع أونلاين بعد ' + d; },\n    fixed: '✅ اتحلت: ',\n    logs: 'اللوجز',\n    min: function (m) { return m + ' دقيقة'; },\n    hours: function (h, m) { return h + ' ساعة و ' + m + ' دقيقة'; },\n    days: function (d) { return d + ' يوم'; }\n  }\n}[LANG];\n\nvar NL = String.fromCharCode(10);\nvar TZ = $now.zoneName;\nvar body = $('Agent Report').first().json.body || {};\nvar server = String(body.server || '').trim();\nif (KNOWN.indexOf(server) < 0) return [];\nif (JSON.stringify(body).length > 500000) return [];\n\n// Coerce every number and flag before the report is stored: the dashboard and the reports print them as they are.\nfunction num(v) { if (v == null || v === '') return null; var n = Number(v); return isFinite(n) ? n : null; }\nfunction nums(o, keys) { if (o && typeof o === 'object') keys.forEach(function (k) { if (k in o) o[k] = num(o[k]); }); }\nfunction list(o, k, fn) { if (!o || !(k in o)) return; o[k] = Array.isArray(o[k]) ? o[k].filter(function (x) { return x && typeof x === 'object'; }) : []; if (fn) o[k].forEach(fn); }\nfunction strs(o, k) { if (o && k in o) o[k] = Array.isArray(o[k]) ? o[k].map(String) : []; }\nnums(body, ['cpu_pct', 'ncpu', 'uptime_h', 'services_running']);\nif ('load' in body) body.load = Array.isArray(body.load) ? body.load.map(num) : [];\nif ('mem' in body && (!body.mem || typeof body.mem !== 'object')) body.mem = null;\nnums(body.mem, ['pct', 'used_gb', 'total_gb', 'swap_pct', 'psi_some60', 'psi_some300', 'psi_full60', 'psi_full300']);\nlist(body, 'disks', function (d) { nums(d, ['pct', 'used_gb', 'total_gb']); });\nlist(body, 'sites', function (s) { nums(s, ['status', 'ms', 'ssl_days']); });\nlist(body, 'containers', function (c) { nums(c, ['exit_code']); });\nstrs(body, 'failed_units');\nstrs(body, 'services');\nif (body.router && typeof body.router === 'object') {\n  nums(body.router, ['uptime_s', 'cpu_pct', 'mem_pct', 'dhcp_bound', 'wlan_clients', 'hotspot_users']);\n  list(body.router, 'lines', function (l) { nums(l, ['rx_bps', 'tx_bps']); l.up = !!l.up; l.running = !!l.running; });\n  list(body.router, 'ports', function (p) { p.running = !!p.running; });\n} else delete body.router;\nlist(body, 'devices', function (d) { nums(d, ['since']); d.up = !!d.up; });\nlist(body, 'backups', function (b) { nums(b, ['max_age_h', 'age_h', 'count']); b.label = String(b.label || '').slice(0, 60); });\n\nvar prev = null;\n$input.all().forEach(function (it) { if (it.json && it.json.server) prev = it.json; });\nvar now = Date.now();\nfunction esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\nfunction dur(ms) { var m = Math.round(ms / 60000); if (m < 60) return T.min(m); var h = Math.floor(m / 60); if (h < 48) return T.hours(h, m % 60); return T.days(Math.round(h / 24)); }\nfunction timeOf(s) { return DateTime.fromSeconds(Number(s)).setZone(TZ).toFormat('dd/MM HH:mm'); }\nvar state = {};\ntry { state = prev && prev.state ? JSON.parse(prev.state) : {}; } catch (e) { state = {}; }\nvar prevBody = {};\ntry { prevBody = prev && prev.payload ? JSON.parse(prev.payload) : {}; } catch (e) { prevBody = {}; }\nvar active = state.active || {};\n\n// Every problem in this report, keyed so the same problem is recognised next time.\nvar probs = {};\nvar oneShot = [];\nfunction add(key, msg, need) { probs[key] = { msg: msg, need: need || 1 }; }\n(body.disks || []).forEach(function (d) { if (d.pct >= DISK_PCT) add('disk:' + d.mount, T.disk(d)); });\nif (body.mem && body.mem.pct >= MEM_PCT) add('mem', T.mem(body.mem.pct), 3);\n// Real memory pressure (PSI). A full swap alone is not a problem (idle pages parked there);\n// pressure is what makes a server slow, so that is what alerts.\nif (body.mem && (body.mem.psi_some300 >= 10 || body.mem.psi_full300 >= 2)) add('mem_psi', T.psi(body.mem.psi_some300), 2);\nif (body.cpu_pct >= CPU_PCT) add('cpu', T.cpu(body.cpu_pct), 5);\n(body.failed_units || []).forEach(function (u) { add('unit:' + u, T.unit(u)); });\n(body.containers || []).forEach(function (c) {\n  if (c.health === 'unhealthy') add('ctr:' + c.name, T.unhealthy(c.name), 2);\n  else if (c.status === 'restarting') add('ctr:' + c.name, T.restarting(c.name), 2);\n  else if (c.status === 'exited' && c.restart && c.restart !== 'no') add('ctr:' + c.name, T.exited(c.name, c.exit_code));\n});\n(body.sites || []).forEach(function (s) {\n  var tag = s.host + (s.owner ? ' [' + s.owner + ']' : '');\n  if (s.error || !s.status || s.status >= 500) add('site:' + s.host, T.site(tag, s.error || ('HTTP ' + s.status)), 2);\n  if (s.ssl_days != null && s.ssl_days < SSL_DAYS) add('ssl:' + s.host, T.ssl(tag, s.ssl_days));\n});\nvar rt = body.router;\nif (rt) {\n  if (rt.error) add('router:unreachable', T.routerDown(rt.error), 2);\n  else {\n    var lines = rt.lines || [];\n    lines.forEach(function (l) {\n      if (l.up) return;\n      var other = lines.filter(function (o) { return o.id !== l.id && o.up; })[0];\n      add('wan:' + l.id, T.wan(l.label, l.running, other && other.label), 2);\n    });\n    (rt.ports || []).forEach(function (p) { if (!p.running) add('port:' + p.name, T.port(p.name), 3); });\n    if (rt.cpu_pct >= ROUTER_CPU_PCT) add('router:cpu', T.routerCpu(rt.cpu_pct), 5);\n    var prt = prevBody.router;\n    if (prt && !prt.error && prt.uptime_s != null && rt.uptime_s != null && rt.uptime_s < prt.uptime_s) oneShot.push(T.reboot(Math.max(1, Math.round(rt.uptime_s / 60))));\n  }\n}\nvar devs = body.devices || [];\n// When the NVR is down the cameras behind it are too; one alert for the NVR says it all.\nvar nvrDown = devs.some(function (d) { return d.group === 'nvr' && !d.up; });\nvar ICON = { printer: '🖨', iot: '📟', nvr: '📹', camera: '🎥', clock: '👆' };\ndevs.forEach(function (d) {\n  if (d.up || (d.group === 'camera' && nvrDown)) return;\n  add('dev:' + d.group + ':' + d.id, T.device(ICON[d.group] || '🔌', d.name, d.since ? timeOf(d.since) : '', d.group === 'nvr'));\n});\n// A backup whose newest copy is older than max_age_h (or that has no copy at all) means the job stopped.\n(body.backups || []).forEach(function (b) {\n  var lim = b.max_age_h || 30;\n  if (b.age_h == null) add('backup:' + b.label, T.noBackup(b.label));\n  else if (b.age_h > lim) add('backup:' + b.label, T.oldBackup(b.label, Math.round(b.age_h), lim));\n});\n\nvar nextActive = {}, opened = [], openedKeys = [], closed = [];\nObject.keys(probs).forEach(function (k) {\n  var a = active[k] || { since: now, count: 0, notified: false };\n  a.count = (a.count || 0) + 1;\n  a.msg = probs[k].msg;\n  if (!a.notified && a.count >= probs[k].need) { a.notified = true; opened.push(a.msg); openedKeys.push(k); }\n  nextActive[k] = a;\n});\nObject.keys(active).forEach(function (k) { if (!probs[k] && active[k].notified) closed.push(active[k].msg + T.lasted(dur(now - active[k].since))); });\n\nvar out = [], kind = '';\nif (!prev) { out.push(T.added); kind = 'new'; }\nif (prev && prev.online === false) { out.push(T.back(dur(now - Number(prev.last_seen)))); kind = 'up'; }\noneShot.forEach(function (m) { out.push('🔴 ' + esc(m)); });\nopened.forEach(function (m) { out.push('🔴 ' + esc(m)); });\nif (opened.length || oneShot.length) kind = 'alert';\nclosed.forEach(function (m) { out.push(T.fixed + esc(m)); });\nif (closed.length && !kind) kind = 'resolved';\nvar message = out.length ? '<b>🖥 ' + esc(server) + '</b>' + NL + out.join(NL) : '';\nif (message.length > 4000) message = message.slice(0, 4000).replace(/&[a-z]*$/, '') + '…';\n\n// The evidence the agent attached for each new problem, sent as a reply under the alert.\nvar logs = body.problem_logs || {};\nvar withLogs = openedKeys.filter(function (k) { return logs[k]; });\nvar logsMessage = '';\nif (withLogs.length) {\n  var each = Math.max(400, Math.floor(3000 / withLogs.length));\n  logsMessage = '<b>🖥 ' + esc(server) + ' · ' + T.logs + '</b>';\n  withLogs.forEach(function (k) {\n    var part = NL + NL + '<b>' + esc(k) + '</b>' + NL + '<pre>' + esc(String(logs[k]).slice(-each)) + '</pre>';\n    if (logsMessage.length + part.length < 4000) logsMessage += part;\n  });\n}\ndelete body.problem_logs;\n\nreturn [{ json: { server: server, online: true, last_seen: now, payload: JSON.stringify(body), state: JSON.stringify({ active: nextActive }), kind: kind, message: message, logs_message: logsMessage } }];\n"
+      },
+      "id": "a8cbc60e-2b06-52eb-b1cf-1a3a68ed366f",
+      "name": "Evaluate Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_status"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "server",
+              "condition": "eq",
+              "keyValue": "={{ $json.server }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "server": "={{ $json.server }}",
+            "online": "={{ $json.online }}",
+            "last_seen": "={{ $json.last_seen }}",
+            "payload": "={{ $json.payload }}",
+            "state": "={{ $json.state }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "server",
+              "displayName": "server",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "online",
+              "displayName": "online",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "last_seen",
+              "displayName": "last_seen",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "payload",
+              "displayName": "payload",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "state",
+              "displayName": "state",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "932d369d-20b9-52b8-8641-5a6d1c8c59a6",
+      "name": "Save Status",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        760,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "7c2ed52a-dd76-5367-8fa4-341441838a57",
+              "leftValue": "={{ $json.message }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1606bc49-12ce-51a7-8677-9d58cbe35b88",
+      "name": "Anything Changed?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        760,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "d1a3434a-ae09-5ca9-be3b-93efad7a0be4",
+      "name": "Every Minute",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_status"
+        },
+        "returnAll": true
+      },
+      "id": "6591d3e0-8690-55d6-8152-2d3e7a1d03ef",
+      "name": "Load All Status",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        300
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// srvmon · Find Silent Servers\n// Runs every minute. A server that has sent nothing for SILENT_MS is marked down, once;\n// Evaluate Report says \"back online\" when it reports again.\n\n// ---- settings ---------------------------------------------------------------------------\nvar LANG = 'en';  // 'en', or 'ar' for Egyptian Arabic\nvar SILENT_MS = 180000;\n// -------------------------------------------------------------------------------------------\n\nvar T = {\n  en: function (min, at) { return '🚨 No report for ' + min + ' minutes (the last one came at ' + at + '). The server is down, or its network is cut'; },\n  ar: function (min, at) { return '🚨 السيرفر مبعتش أي قراءة من ' + min + ' دقيقة (آخر قراءة ' + at + '). يا إما واقع يا إما النت عنده مقطوع'; }\n}[LANG];\n\nvar NL = String.fromCharCode(10);\nvar now = Date.now();\nfunction esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\nvar out = [];\n$input.all().forEach(function (it) {\n  var r = it.json;\n  if (!r.server || r.online === false) return;\n  var age = now - Number(r.last_seen);\n  if (age > SILENT_MS) {\n    var at = DateTime.fromMillis(Number(r.last_seen)).setZone($now.zoneName).toFormat('HH:mm');\n    out.push({ json: { server: r.server, online: false, last_seen: Number(r.last_seen), payload: r.payload, state: r.state, kind: 'down', message: '<b>🖥 ' + esc(r.server) + '</b>' + NL + T(Math.round(age / 60000), at), logs_message: '' } });\n  }\n});\nreturn out;\n"
+      },
+      "id": "3b2eee79-f034-5945-8055-64d602ffac56",
+      "name": "Find Silent Servers",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_CHAT_ID",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "4a30c902-d07b-5151-b15f-58e4742ac611",
+      "name": "Send Telegram Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1020,
+        40
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1d70209-a704-53dc-84d8-a45c245721bc",
+              "leftValue": "={{ $('Anything Changed?').item.json.logs_message }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "dcd6c39a-19c8-54f6-9911-1ac80c2a9ef2",
+      "name": "Has Logs?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        1260,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_CHAT_ID",
+        "text": "={{ $('Anything Changed?').item.json.logs_message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true,
+          "reply_to_message_id": "={{ $json.result.message_id }}",
+          "disable_notification": true
+        }
+      },
+      "id": "d30569b6-bbf8-54e5-89df-df002a53555c",
+      "name": "Send Logs",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1500,
+        40
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_events"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "server": "={{ $json.server }}",
+            "kind": "={{ $json.kind }}",
+            "message": "={{ $json.message }}",
+            "ts": "={{ Date.now() }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "server",
+              "displayName": "server",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "kind",
+              "displayName": "kind",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ts",
+              "displayName": "ts",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b0c58292-ae27-5be2-856c-439677e93d8e",
+      "name": "Log Event",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1020,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v21.0/YOUR_PHONE_NUMBER_ID/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messaging_product: 'whatsapp', to: 'YOUR_WHATSAPP_NUMBER', type: 'text', text: { body: $json.message.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&') } }) }}",
+        "options": {}
+      },
+      "id": "28484ad7-dca6-51ff-afd2-5fcaaafe55ec",
+      "name": "Send WhatsApp (optional)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1020,
+        440
+      ],
+      "disabled": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "srvmon/CHANGE-ME",
+        "options": {},
+        "responseMode": "responseNode",
+        "authentication": "basicAuth"
+      },
+      "id": "427afa78-8f5e-5d49-bc53-c37bb2c08cea",
+      "name": "Dashboard Page",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        640
+      ],
+      "webhookId": "8f95631c-6ae2-51be-ac41-105918227e75"
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_status"
+        },
+        "returnAll": true
+      },
+      "id": "0e70715f-8c81-5313-9406-feff9ad52087",
+      "name": "Load Status",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        640
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_events"
+        },
+        "returnAll": false,
+        "limit": 40,
+        "orderBy": true,
+        "orderByColumn": "createdAt",
+        "orderByDirection": "DESC"
+      },
+      "id": "c17b1e47-9350-5d2b-9713-089c6276ce0f",
+      "name": "Load Recent Events",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        640
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// srvmon · Build Dashboard\n// One HTML page: open problems, a card per shop (internet lines, router, devices), a card per\n// server, the sites table and the latest events. It refreshes itself every minute and follows\n// the browser's light or dark theme.\n\n// ---- settings ---------------------------------------------------------------------------\nvar LANG = 'en';  // 'en', or 'ar' for Egyptian Arabic (the page turns right to left)\n// Display names for servers that watch a shop's router and devices, e.g. { 'shop-1': '☕ Main street café' }.\n// Any server that sends router or device data gets a shop card, named or not.\nvar SHOPS = {};\n// -------------------------------------------------------------------------------------------\n\nvar T = {\n  en: {\n    s: ' s', m: ' min', h: ' h', d: ' d', day: ' d ', hr: ' h ',\n    noNet: 'no internet from the provider', unplugged: 'cable unplugged', inUse: 'in use',\n    lbl: { printer: '🖨 Printers', camera: '🎥 Cameras', nvr: '📹 NVR', iot: '📟 IoT box', clock: '👆 Time clock' },\n    router: '📡 Router', lines: '🌐 Internet lines', upFor: 'up ', connected: '👥 Connected', ports: '🔗 Ports', devices: '🏪 Devices',\n    via: 'via', stale: '⚠️ This data is old; the server has not reported for ', silent: '🚨 No report for ',\n    running: ' running', servicesRunning: ' running', backups: '💾 Backups', newest: function (h) { return ' · newest ' + h + ' h old'; },\n    noCopy: ': no copy', hOld: function (h) { return ': ' + h + ' h old'; }, details: 'Containers and services', pressure: 'pressure ',\n    days: ' d', allGood: 'All good ✅', since: 'for ', noEvents: 'No events yet',\n    kProblems: 'Open problems', kOnline: 'Servers online', kLines: 'Internet lines', kDevices: 'Shop devices', kSites: 'Sites up', kCtr: 'Containers running',\n    title: 'Server Monitor', h1: '🖥 Servers and shops', updated: 'Updated ', refresh: ' · refreshes every minute',\n    nProblems: '⚠️ Problems', nShops: '🏪 Shops', nServers: '🖥 Servers', nSites: '🌐 Sites', nEvents: '🔔 Events',\n    hProblems: '⚠️ Open problems', hShops: '🏪 Shops', hServers: '🖥 Servers', hSites: '🌐 Sites', hEvents: '🔔 Recent events',\n    thHost: 'Host', thServer: 'Server', thStatus: 'Status', thTime: 'Time', thSsl: 'TLS',\n    printerWord: /\\s+printer(?=\\s|$)/i, short: 'd MMM HH:mm', long: 'd MMM yyyy, HH:mm:ss'\n  },\n  ar: {\n    s: ' ث', m: ' د', h: ' س', d: ' يوم', day: ' يوم ', hr: ' س ',\n    noNet: 'مفيش نت من الشركة', unplugged: 'الكابل مفصول', inUse: 'مستخدم',\n    lbl: { printer: '🖨 الطابعات', camera: '🎥 الكاميرات', nvr: '📹 NVR', iot: '📟 IoT box', clock: '👆 البصمة' },\n    router: '📡 الراوتر', lines: '🌐 خطوط النت', upFor: 'شغال من ', connected: '👥 أجهزة متصلة', ports: '🔗 البورتات', devices: '🏪 أجهزة المحل',\n    via: 'عبر سيرفر', stale: '⚠️ البيانات دي قديمة، السيرفر مبعتش من ', silent: '🚨 مش بيبعت من ',\n    running: ' شغال', servicesRunning: ' شغالة', backups: '💾 الباك أب', newest: function (h) { return ' · آخر نسخة من ' + h + ' س'; },\n    noCopy: ': مفيش نسخ', hOld: function (h) { return ': من ' + h + ' س'; }, details: 'تفاصيل الكونتينرات والخدمات', pressure: 'ضغط ',\n    days: ' يوم', allGood: 'كله تمام ✅', since: 'من ', noEvents: 'مفيش أحداث لسه',\n    kProblems: 'مشاكل مفتوحة', kOnline: 'سيرفرات أونلاين', kLines: 'خطوط النت', kDevices: 'أجهزة المحلات', kSites: 'مواقع شغالة', kCtr: 'كونتينرات شغالة',\n    title: 'مراقبة السيرفرات', h1: '🖥 مراقبة السيرفرات والمحلات', updated: 'آخر تحديث ', refresh: ' · الصفحة بتتحدث كل دقيقة',\n    nProblems: '⚠️ المشاكل', nShops: '🏪 المحلات', nServers: '🖥 السيرفرات', nSites: '🌐 المواقع', nEvents: '🔔 الأحداث',\n    hProblems: '⚠️ المشاكل المفتوحة', hShops: '🏪 المحلات', hServers: '🖥 السيرفرات', hSites: '🌐 المواقع', hEvents: '🔔 آخر الأحداث',\n    thHost: 'الدومين', thServer: 'السيرفر', thStatus: 'الحالة', thTime: 'الرد', thSsl: 'SSL',\n    printerWord: /^طابعة\\s+/, short: 'dd/MM HH:mm', long: 'dd/MM/yyyy HH:mm:ss'\n  }\n}[LANG];\nvar RTL = LANG === 'ar';\n\nvar NL = String.fromCharCode(10);\nvar TZ = $now.zoneName;\nvar now = Date.now();\nfunction esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;'); }\nfunction ago(ms) { var s = Math.max(0, Math.round(ms / 1000)); if (s < 90) return s + T.s; var m = Math.round(s / 60); if (m < 90) return m + T.m; var h = Math.round(m / 60); if (h < 48) return h + T.h; return Math.round(h / 24) + T.d; }\nfunction upt(h) { if (h == null) return '?'; var d = Math.floor(h / 24); return d ? d + T.day + Math.round(h % 24) + T.h : Math.round(h) + T.h; }\nfunction hdur(s) { s = Number(s) || 0; var d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? d + T.day + h + T.h : (h ? h + T.hr + m + T.m : m + T.m); }\nfunction mbps(b) { return b == null ? '—' : (b >= 1e6 ? (b / 1e6).toFixed(1) + ' Mbps' : Math.round(b / 1e3) + ' kbps'); }\nfunction bar(p) { p = Number(p) || 0; var c = p >= 90 ? 'bad' : (p >= 75 ? 'warn' : 'ok'); return '<div class=\"bar\"><i class=\"' + c + '\" style=\"width:' + Math.min(100, p) + '%\"></i></div>'; }\nfunction when(ms) { return DateTime.fromMillis(Number(ms)).setZone(TZ).toFormat(T.short); }\n// Values stay left to right inside an Arabic page; without dir=ltr the bidi algorithm reorders them (/boot shows as boot/).\nfunction val(s) { return '<span class=\"v\" dir=\"ltr\">' + esc(s) + '</span>'; }\nfunction row(label, value) { return '<div class=\"row\"><span>' + label + '</span>' + val(value) + '</div>'; }\nfunction badge(n) { return n ? '<span class=\"badge\">⚠️ ' + n + '</span>' : ''; }\n// A shop is watched from the server that sits in it; its alert keys are counted on the shop card, not the server card.\nfunction isShopKey(k) { return /^(wan|router|port|dev):/.test(k); }\nfunction shopName(server) { return SHOPS[server] || '🏪 ' + server; }\n\nfunction lineHtml(l, inUse) {\n  var st = l.up ? val('↓ ' + mbps(l.rx_bps) + '   ↑ ' + mbps(l.tx_bps)) : (l.running ? T.noNet : T.unplugged);\n  return '<div class=\"line ' + (l.up ? 'ok' : 'bad') + '\"><div class=\"lt\"><span>' + (l.up ? '🟢' : '🔴') + ' ' + esc(l.label) + '</span>'\n    + (inUse ? '<span class=\"tag\">' + T.inUse + '</span>' : '') + '</div><div class=\"ls\">' + st + '</div></div>';\n}\nfunction chip(d, isPrinter) {\n  var nm = String(d.name || d.id || '');\n  if (isPrinter) nm = nm.replace(T.printerWord, '');\n  var cls = d.up ? (d.quiet || d.off ? 'zz' : 'ok') : 'bad';\n  return '<span class=\"chip ' + cls + '\" title=\"' + esc(d.id || '') + '\">' + esc(nm) + (!d.up && d.since ? ' <small>· ' + ago(now - d.since * 1000) + '</small>' : '') + '</span>';\n}\nfunction devicesHtml(dv) {\n  var grp = {}, order = [];\n  dv.forEach(function (d) { var k = d.group || 'other'; if (!grp[k]) { grp[k] = { up: 0, list: [] }; order.push(k); } grp[k].list.push(d); if (d.up) grp[k].up++; });\n  var keys = ['printer', 'camera', 'nvr', 'iot', 'clock'].filter(function (k) { return grp[k]; }).concat(order.filter(function (k) { return !T.lbl[k]; }));\n  return keys.map(function (k) {\n    var g = grp[k], n = g.list.length;\n    // Small groups list every device; single devices and big groups (27 cameras) only show the ones that are down.\n    var list = n > 1 && n <= 6 ? g.list : g.list.filter(function (d) { return !d.up; });\n    return '<div class=\"dg\"><div class=\"row\"><span>' + (T.lbl[k] || esc(k)) + '</span><b class=\"' + (g.up === n ? 'g' : 'r') + '\" dir=\"ltr\">' + g.up + '/' + n + '</b></div>'\n      + (list.length ? '<div class=\"chips\">' + list.map(function (d) { return chip(d, k === 'printer'); }).join('') + '</div>' : '') + '</div>';\n  }).join('');\n}\nfunction shopCard(server, p, nProb, isOn, lastSeen) {\n  var rt = p.router, dv = p.devices || [], net = '', dev = '';\n  if (rt && rt.error) net = '<div class=\"sec\">' + T.router + '</div><div class=\"bad-list\" dir=\"ltr\">' + esc(rt.error) + '</div>';\n  else if (rt) {\n    var ports = rt.ports || [], pd = ports.filter(function (x) { return !x.running; });\n    net = '<div class=\"sec\">' + T.lines + '</div>' + (rt.lines || []).map(function (l) { return lineHtml(l, rt.line_in_use === l.id); }).join('')\n      + '<div class=\"sec\">' + T.router + ' <span class=\"muted\"><bdi dir=\"ltr\">' + esc(rt.model || '') + ' · ' + esc(String(rt.version || '').replace(/\\s*\\(.*\\)$/, '')) + '</bdi> · ' + T.upFor + hdur(rt.uptime_s) + '</span></div>'\n      + row('🧮 CPU / RAM', rt.cpu_pct + '% · ' + rt.mem_pct + '%')\n      + row(T.connected, rt.dhcp_bound + (rt.wlan_clients != null ? ' · wifi ' + rt.wlan_clients : '') + (rt.hotspot_users != null ? ' · hotspot ' + rt.hotspot_users : ''))\n      + (ports.length ? '<div class=\"row\"><span>' + T.ports + '</span><b class=\"' + (pd.length ? 'r' : 'g') + '\" dir=\"ltr\">' + (ports.length - pd.length) + '/' + ports.length + '</b></div>'\n        + '<div class=\"chips\">' + ports.map(function (x) { return '<span class=\"chip ' + (x.running ? 'ok' : 'bad') + '\" dir=\"ltr\">' + esc(x.name) + '</span>'; }).join('') + '</div>' : '');\n  }\n  if (dv.length) dev = '<div class=\"sec\">' + T.devices + '</div>' + devicesHtml(dv);\n  return '<div class=\"card shop' + (!isOn ? ' down' : (nProb ? ' warn' : '')) + '\">'\n    + '<div class=\"hd\"><b class=\"big\">' + esc(shopName(server)) + '</b><small>' + T.via + ' <bdi dir=\"ltr\">' + esc(server) + '</bdi></small><span class=\"ago\">' + badge(nProb) + '</span></div>'\n    + (isOn ? '' : '<div class=\"bad-list txt\">' + T.stale + ago(now - lastSeen) + '</div>')\n    + '<div class=\"cols\"><div>' + net + '</div>' + (dev ? '<div>' + dev + '</div>' : '') + '</div></div>';\n}\n\nvar rows = $('Load Status').all().map(function (i) { return i.json; }).filter(function (r) { return r.server; });\nvar events = $input.all().map(function (i) { return i.json; }).filter(function (e) { return e.server; });\nvar problems = [], sites = [], srv = [], shops = [], online = 0, ctrTotal = 0, ctrRun = 0, linesUp = 0, linesAll = 0, devUp = 0, devAll = 0;\nrows.forEach(function (r) {\n  var p = {}; try { p = JSON.parse(r.payload || '{}'); } catch (e) {}\n  var st = {}; try { st = JSON.parse(r.state || '{}'); } catch (e) {}\n  var last = Number(r.last_seen);\n  var isOn = r.online !== false && (now - last) < 180000;\n  if (isOn) online++; else problems.push({ who: '🖥 ' + r.server, msg: T.silent + ago(now - last) });\n  var act = st.active || {}, nSrv = 0, nShop = 0;\n  Object.keys(act).forEach(function (k) {\n    if (!act[k].notified) return;\n    var shop = isShopKey(k);\n    if (shop) nShop++; else nSrv++;\n    problems.push({ who: shop ? shopName(r.server) : '🖥 ' + r.server, msg: act[k].msg, since: act[k].since });\n  });\n  (p.sites || []).forEach(function (s) { sites.push(s); });\n  if (p.router || (p.devices || []).length) {\n    shops.push({ name: r.server, html: shopCard(r.server, p, nShop, isOn, last) });\n    ((p.router && p.router.lines) || []).forEach(function (l) { linesAll++; if (l.up) linesUp++; });\n    (p.devices || []).forEach(function (d) { devAll++; if (d.up) devUp++; });\n  }\n  var ctr = p.containers || [];\n  var running = ctr.filter(function (c) { return c.status === 'running'; }).length;\n  ctrTotal += ctr.length; ctrRun += running;\n  var badCtr = ctr.filter(function (c) { return c.status !== 'running' || c.health === 'unhealthy'; });\n  var failed = p.failed_units || [];\n  var bks = p.backups || [];\n  var oldBk = bks.filter(function (b) { return b.age_h == null || b.age_h > (b.max_age_h || 30); });\n  var newestBk = bks.length ? Math.round(Math.min.apply(null, bks.map(function (b) { return b.age_h == null ? 1e9 : b.age_h; }))) : '';\n  var disks = (p.disks || []).map(function (d) { return row('💾 <bdi dir=\"ltr\">' + esc(d.mount) + '</bdi>', d.pct + '% · ' + d.used_gb + '/' + d.total_gb + 'G') + bar(d.pct); }).join('');\n  var html = '<div class=\"card' + (!isOn ? ' down' : (nSrv ? ' warn' : '')) + '\">'\n    + '<div class=\"hd\"><span class=\"dot ' + (isOn ? 'on' : 'off') + '\"></span><b>' + esc(r.server) + '</b><small dir=\"ltr\">' + esc(p.hostname || '') + '</small>'\n    + (p.router || (p.devices || []).length ? '<small class=\"shoptag\">' + esc(shopName(r.server)) + '</small>' : '') + '<span class=\"ago\">' + badge(nSrv) + ' <small>' + ago(now - last) + '</small></span></div>'\n    + '<div class=\"meta\"><bdi dir=\"ltr\">' + esc(p.os || '') + ' · ' + esc(p.ncpu || '?') + ' CPU</bdi> · ' + T.upFor + upt(p.uptime_h) + '</div>'\n    + row('🔥 CPU', (p.cpu_pct != null ? p.cpu_pct : '?') + '% · load ' + (p.load || []).join(' / ')) + bar(p.cpu_pct)\n    // Memory pressure is words and a number; it gets its own isolate so it reads right in both directions.\n    + '<div class=\"row\"><span>🧠 RAM</span><span class=\"v\">' + (p.mem ? val(p.mem.pct + '% · ' + p.mem.used_gb + '/' + p.mem.total_gb + 'G')\n      + (p.mem.psi_some60 != null ? ' · <bdi>' + T.pressure + '<span dir=\"ltr\">' + esc(p.mem.psi_some60) + '%</span></bdi>' : '') : '?') + '</span></div>' + bar(p.mem ? p.mem.pct : 0)\n    + disks\n    + '<div class=\"row\"><span>🐳 Docker</span><span>' + (ctr.length ? running + '/' + ctr.length + T.running : '—') + '</span></div>'\n    + (badCtr.length ? '<div class=\"bad-list\" dir=\"ltr\">' + badCtr.map(function (c) { return esc(c.name) + ' (' + esc(c.health === 'unhealthy' ? 'unhealthy' : c.status) + ')'; }).join('<br>') + '</div>' : '')\n    + '<div class=\"row\"><span>⚙️ Services</span><span>' + esc(p.services_running || 0) + T.servicesRunning + (failed.length ? ' · <b class=\"r\">' + failed.length + ' failed</b>' : '') + '</span></div>'\n    + (failed.length ? '<div class=\"bad-list\" dir=\"ltr\">' + failed.map(esc).join('<br>') + '</div>' : '')\n    + (bks.length ? '<div class=\"row\"><span>' + T.backups + '</span><span class=\"' + (oldBk.length ? 'r' : 'g') + '\">' + (bks.length - oldBk.length) + '/' + bks.length + esc(T.newest(newestBk)) + '</span></div>'\n      + (oldBk.length ? '<div class=\"bad-list txt\">' + oldBk.map(function (b) { return esc(b.label) + (b.age_h == null ? T.noCopy : esc(T.hOld(Math.round(b.age_h)))); }).join('<br>') + '</div>' : '') : '')\n    + '<details><summary>' + T.details + '</summary><div class=\"small\">'\n    + ctr.map(function (c) { return '<div>' + (c.status === 'running' ? (c.health === 'unhealthy' ? '🟠' : '🟢') : '🔴') + ' ' + esc(c.name) + ' <span class=\"muted\">' + esc(c.image || '') + '</span></div>'; }).join('')\n    + (ctr.length ? '<hr>' : '') + (p.services || []).map(function (s) { return '<div>⚙️ ' + esc(s) + '</div>'; }).join('')\n    + '</div></details></div>';\n  // Servers that are down or have open problems move to the front.\n  srv.push({ name: r.server, rank: !isOn ? 0 : (nSrv || badCtr.length || failed.length || oldBk.length ? 1 : 2), html: html });\n});\nsrv.sort(function (a, b) { return (a.rank - b.rank) || a.name.localeCompare(b.name); });\nshops.sort(function (a, b) { return a.name.localeCompare(b.name); });\nsites.sort(function (a, b) { return String(a.owner || '').localeCompare(String(b.owner || '')) || a.host.localeCompare(b.host); });\nvar sitesUp = sites.filter(function (s) { return !s.error && s.status && s.status < 500; }).length;\nvar siteRows = sites.map(function (s) {\n  var ok = !s.error && s.status && s.status < 500;\n  var sc = s.ssl_days == null ? '' : (s.ssl_days < 14 ? 'r' : (s.ssl_days < 30 ? 'y' : ''));\n  return '<tr><td class=\"host\" dir=\"ltr\"><a href=\"https://' + esc(s.host) + '\" target=\"_blank\" rel=\"noopener noreferrer\">' + esc(s.host) + '</a></td><td>' + esc(s.owner || '') + '</td><td class=\"' + (ok ? 'g' : 'r') + '\">' + esc(s.error || s.status) + '</td><td>' + (s.ms != null ? '<bdi dir=\"ltr\">' + esc(s.ms) + ' ms</bdi>' : '') + '</td><td class=\"' + sc + '\">' + (s.ssl_days != null ? esc(s.ssl_days) + T.days : '—') + '</td></tr>';\n}).join('');\nvar probHtml = problems.length ? problems.map(function (p) { return '<li><b>' + esc(p.who) + '</b> ' + esc(p.msg) + (p.since ? ' <span class=\"muted\">' + T.since + ago(now - p.since) + '</span>' : '') + '</li>'; }).join('') : '<li class=\"g\">' + T.allGood + '</li>';\nvar evHtml = events.length ? events.map(function (e) {\n  var lines = String(e.message || '').replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').split(NL);\n  var body = lines.length > 1 ? lines.slice(1) : lines;\n  return '<li><span class=\"muted\">' + when(e.ts) + '</span> <b>' + esc(e.server) + '</b> ' + esc(body.join(' · ').replace(/^[🔴✅🆕🚨]\\s*/u, '')) + '</li>';\n}).join('') : '<li class=\"muted\">' + T.noEvents + '</li>';\nvar kpi = function (label, a, b, cls) { return '<div class=\"kpi\">' + label + '<b class=\"' + cls + '\" dir=\"ltr\">' + a + (b != null ? '/' + b : '') + '</b></div>'; };\nvar css = \":root{--bg:#f4f6f8;--card:#fff;--fg:#1d2329;--muted:#6b7682;--line:#e3e7eb;--ok:#1f9d55;--warn:#d69e2e;--bad:#e03e3e}\"\n  + \"@media (prefers-color-scheme:dark){:root{--bg:#0f1418;--card:#182027;--fg:#e6edf3;--muted:#8b98a5;--line:#26313b}}\"\n  + \"*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;font-family:system-ui,'Segoe UI',Tahoma,sans-serif;background:var(--bg);color:var(--fg);padding:16px;max-width:1400px;margin-inline:auto;overflow-x:hidden}\"\n  + \"h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 10px;display:flex;align-items:center;gap:8px}h2 .muted{font-weight:400;font-size:12px}.sub{color:var(--muted);font-size:12px;margin-top:2px}\"\n  + \".nav{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.nav a{font-size:12px;text-decoration:none;border:1px solid var(--line);background:var(--card);border-radius:999px;padding:3px 11px}\"\n  + \".sum{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:14px 0}.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-size:12px;color:var(--muted)}.kpi b{font-size:22px;display:block;color:var(--fg);text-align:end}\"\n  + \".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,290px),1fr));gap:12px}\"\n  + \".shops{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr));gap:12px}\"\n  + \".cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,230px),1fr));gap:0 22px}.cols>div>.sec:first-child{border-top:0;padding-top:0}\"\n  + \".card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;min-width:0;display:flex;flex-direction:column}.card.down{border-color:var(--bad);box-shadow:0 0 0 1px var(--bad)}.card.warn{border-color:var(--warn)}\"\n  + \".hd{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.hd small{color:var(--muted);font-size:11px}.ago{margin-inline-start:auto;display:flex;align-items:center;gap:6px}.big{font-size:17px}.shoptag{border:1px solid var(--line);border-radius:999px;padding:0 7px}\"\n  + \".badge{background:var(--warn);color:#1d2329;border-radius:999px;padding:1px 8px;font-size:11px;font-weight:600}\"\n  + \".dot{width:10px;height:10px;border-radius:50%;flex:none}.on{background:var(--ok)}.off{background:var(--bad)}\"\n  + \".meta{color:var(--muted);font-size:12px;margin:4px 0 6px}.row{display:flex;justify-content:space-between;gap:8px;font-size:13px;margin-top:7px}.v{font-variant-numeric:tabular-nums;white-space:pre-wrap}\"\n  + \".sec{margin-top:14px;padding-top:10px;border-top:1px solid var(--line);font-size:13px;font-weight:600}.sec .muted{font-weight:400;font-size:11px}\"\n  + \".line{border:1px solid var(--line);border-inline-start:4px solid var(--ok);border-radius:8px;padding:7px 10px;margin-top:7px}.line.bad{border-inline-start-color:var(--bad)}\"\n  + \".lt{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:13px}.ls{font-size:12px;color:var(--muted);margin-top:3px}.line.bad .ls{color:var(--bad)}\"\n  + \".tag{color:var(--ok);border:1px solid var(--ok);border-radius:999px;padding:0 8px;font-size:11px;white-space:nowrap}\"\n  + \".dg{margin-bottom:4px}.chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}.chip{font-size:12px;border-radius:999px;padding:2px 9px;border:1px solid var(--line);white-space:nowrap}\"\n  + \".chip.ok{border-color:var(--ok);color:var(--ok)}.chip.bad{background:var(--bad);border-color:var(--bad);color:#fff}.chip.bad small{opacity:.85}.chip.zz{color:var(--muted)}\"\n  + \".bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:3px}.bar i{display:block;height:100%}.bar .ok{background:var(--ok)}.bar .warn{background:var(--warn)}.bar .bad{background:var(--bad)}\"\n  + \".bad-list{color:var(--bad);font-size:12px;margin-top:4px;text-align:left}.bad-list.txt{text-align:start}.small{font-size:12px;max-height:260px;overflow:auto;direction:ltr;text-align:left}.small div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\"\n  + \".card details{margin-top:auto;padding-top:12px}summary{cursor:pointer;color:var(--muted);font-size:12px}hr{border:0;border-top:1px solid var(--line)}\"\n  + \".muted{color:var(--muted)}.g{color:var(--ok)}.r{color:var(--bad)}.y{color:var(--warn)}\"\n  + \"section{margin-top:24px;scroll-margin-top:12px}.box{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}\"\n  + \".two{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,520px),1fr));gap:12px;align-items:start;margin-top:24px}.two>section{margin-top:0}\"\n  + \".tw{overflow-x:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;background:var(--card);font-size:13px}\"\n  + \"td,th{padding:7px 10px;border-bottom:1px solid var(--line);text-align:start;white-space:nowrap}\" + (RTL ? \"td.host{text-align:right}\" : \"\") + \"th{color:var(--muted);font-weight:500}a{color:inherit}\"\n  + \"ul{margin:0;padding-inline-start:18px}li{margin:5px 0;font-size:13px}.ev{max-height:640px;overflow:auto}\"\n  + \"@media (max-width:600px){body{padding:12px}.sum{grid-template-columns:1fr 1fr}td,th{padding:6px 5px;font-size:11.5px}td.host{white-space:normal;word-break:break-all}}\";\nvar html = '<!doctype html><html lang=\"' + LANG + '\" dir=\"' + (RTL ? 'rtl' : 'ltr') + '\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex,nofollow\"><meta name=\"referrer\" content=\"no-referrer\"><meta http-equiv=\"refresh\" content=\"60\"><title>' + T.title + '</title><style>' + css + '</style></head><body>'\n  + '<h1>' + T.h1 + '</h1><div class=\"sub\">' + T.updated + DateTime.now().setZone(TZ).toFormat(T.long) + T.refresh + '</div>'\n  + '<nav class=\"nav\"><a href=\"#problems\">' + T.nProblems + '</a>' + (shops.length ? '<a href=\"#shops\">' + T.nShops + '</a>' : '') + '<a href=\"#servers\">' + T.nServers + '</a><a href=\"#sites\">' + T.nSites + '</a><a href=\"#events\">' + T.nEvents + '</a></nav>'\n  + '<div class=\"sum\">'\n  + kpi(T.kProblems, problems.length, null, problems.length ? 'r' : 'g')\n  + kpi(T.kOnline, online, rows.length, online === rows.length ? 'g' : 'r')\n  + (linesAll ? kpi(T.kLines, linesUp, linesAll, linesUp === linesAll ? 'g' : 'r') : '')\n  + (devAll ? kpi(T.kDevices, devUp, devAll, devUp === devAll ? 'g' : 'r') : '')\n  + kpi(T.kSites, sitesUp, sites.length, sitesUp === sites.length ? 'g' : 'r')\n  + kpi(T.kCtr, ctrRun, ctrTotal, '')\n  + '</div>'\n  + '<section id=\"problems\" class=\"box\"><h2>' + T.hProblems + '</h2><ul>' + probHtml + '</ul></section>'\n  + (shops.length ? '<section id=\"shops\"><h2>' + T.hShops + '</h2><div class=\"shops\">' + shops.map(function (s) { return s.html; }).join('') + '</div></section>' : '')\n  + '<section id=\"servers\"><h2>' + T.hServers + ' <span class=\"muted\" dir=\"ltr\">' + online + '/' + rows.length + '</span></h2><div class=\"grid\">' + srv.map(function (s) { return s.html; }).join('') + '</div></section>'\n  + '<div class=\"two\"><section id=\"sites\"><h2>' + T.hSites + ' <span class=\"muted\" dir=\"ltr\">' + sitesUp + '/' + sites.length + '</span></h2><div class=\"tw\"><table><tr><th>' + T.thHost + '</th><th>' + T.thServer + '</th><th>' + T.thStatus + '</th><th>' + T.thTime + '</th><th>' + T.thSsl + '</th></tr>' + siteRows + '</table></div></section>'\n  + '<section id=\"events\" class=\"box\"><h2>' + T.hEvents + '</h2><ul class=\"ev\">' + evHtml + '</ul></section></div>'\n  + '</body></html>';\nreturn [{ json: { html: html } }];\n"
+      },
+      "id": "a788fb5c-0dee-5f20-98e0-ba16a5249f42",
+      "name": "Build Dashboard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Robots-Tag",
+                "value": "noindex, nofollow"
+              },
+              {
+                "name": "Referrer-Policy",
+                "value": "no-referrer"
+              },
+              {
+                "name": "X-Content-Type-Options",
+                "value": "nosniff"
+              }
+            ]
+          }
+        }
+      },
+      "id": "59a48dde-85b3-535b-9ac5-9c61916753aa",
+      "name": "Send Dashboard",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        960,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "356a644b-f78c-52e6-995e-03bbe26af63f",
+      "name": "Daily 9 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        920
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_status"
+        },
+        "returnAll": true
+      },
+      "id": "e6b7a2f3-e6da-5d9a-bda0-4cb7e8a65cef",
+      "name": "Load Status (Daily)",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        920
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_events"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "ts",
+              "condition": "gt",
+              "keyValue": "={{ Date.now() - 86400000 }}"
+            }
+          ]
+        },
+        "returnAll": true
+      },
+      "id": "4405e964-51bf-5a33-9836-b59f1bc7bcc8",
+      "name": "Load Events 24h",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        920
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// srvmon · Build Daily Report\n// The morning summary on Telegram: one line per server, the shops, the sites, and what\n// happened in the last 24 hours.\n\n// ---- settings ---------------------------------------------------------------------------\nvar LANG = 'en';  // 'en', or 'ar' for Egyptian Arabic\nvar DASHBOARD_URL = '';  // optional, e.g. 'https://n8n.example.com/webhook/srvmon/<dashboard token>'\n// -------------------------------------------------------------------------------------------\n\nvar T = {\n  en: {\n    head: '📊 <b>Daily server report</b> · ', online: function (a, b) { return 'Servers: ' + a + '/' + b + ' online'; },\n    open: function (n) { return ' · ⚠️ ' + n + ' open'; }, stale: function (n) { return ' · 💾 ' + n + ' late backup' + (n > 1 ? 's' : ''); },\n    shop: function (s, l, d) { return '🏪 <b>' + s + '</b>' + (l ? ': lines ' + l : '') + (d ? (l ? ' · ' : ': ') + 'devices ' + d : ''); },\n    sites: function (a, b) { return '🌐 Sites: ' + a + '/' + b + ' up'; }, ssl: function (d) { return ' certificate expires in ' + d + ' days'; },\n    day: function (a, f) { return '🔔 Last 24 hours: ' + a + ' alert' + (a === 1 ? '' : 's') + ', ' + f + ' resolved'; },\n    link: 'Open the dashboard', date: 'd MMM yyyy'\n  },\n  ar: {\n    head: '📊 <b>تقرير السيرفرات</b> · ', online: function (a, b) { return 'السيرفرات: ' + a + '/' + b + ' أونلاين'; },\n    open: function (n) { return ' · ⚠️ ' + n + ' مشكلة'; }, stale: function (n) { return ' · 💾 ' + n + ' باك أب متأخر'; },\n    shop: function (s, l, d) { return '🏪 <b>' + s + '</b>' + (l ? ': خطوط النت ' + l : '') + (d ? (l ? ' · ' : ': ') + 'الأجهزة ' + d : ''); },\n    sites: function (a, b) { return '🌐 المواقع: ' + a + '/' + b + ' شغالة'; }, ssl: function (d) { return ' شهادته فاضلها ' + d + ' يوم'; },\n    day: function (a, f) { return '🔔 آخر 24 ساعة: ' + a + ' تنبيه، و ' + f + ' اتحلّت'; },\n    link: 'افتح الداشبورد', date: 'dd/MM/yyyy'\n  }\n}[LANG];\n\nvar NL = String.fromCharCode(10);\nvar TZ = $now.zoneName;\nvar now = Date.now();\nfunction esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\nvar rows = $('Load Status (Daily)').all().map(function (i) { return i.json; }).filter(function (r) { return r.server; });\nrows.sort(function (a, b) { return a.server.localeCompare(b.server); });\nvar events = $input.all().map(function (i) { return i.json; }).filter(function (e) { return e.server; });\nvar lines = [], shops = [], allSites = [], up = 0;\nrows.forEach(function (r) {\n  var p = {}; try { p = JSON.parse(r.payload || '{}'); } catch (e) {}\n  var st = {}; try { st = JSON.parse(r.state || '{}'); } catch (e) {}\n  var isOn = r.online !== false && now - Number(r.last_seen) < 180000;\n  if (isOn) up++;\n  var dmax = (p.disks || []).reduce(function (m, d) { return Math.max(m, d.pct); }, 0);\n  var ctr = p.containers || [];\n  var run = ctr.filter(function (c) { return c.status === 'running'; }).length;\n  var act = Object.keys(st.active || {}).filter(function (k) { return st.active[k].notified; }).length;\n  var late = (p.backups || []).filter(function (b) { return b.age_h == null || b.age_h > (b.max_age_h || 30); }).length;\n  lines.push((isOn ? (act ? '🟠' : '🟢') : '🔴') + ' <b>' + esc(r.server) + '</b>: CPU ' + p.cpu_pct + '% · RAM ' + (p.mem ? p.mem.pct : '?') + '% · Disk ' + dmax + '%'\n    + (ctr.length ? ' · 🐳 ' + run + '/' + ctr.length : '') + (act ? T.open(act) : '') + (late ? T.stale(late) : ''));\n  var ln = (p.router && p.router.lines) || [], dv = p.devices || [];\n  if (ln.length || dv.length) {\n    var lu = ln.filter(function (l) { return l.up; }).length, du = dv.filter(function (d) { return d.up; }).length;\n    shops.push(T.shop(esc(r.server), ln.length ? lu + '/' + ln.length : '', dv.length ? du + '/' + dv.length : ''));\n  }\n  (p.sites || []).forEach(function (s) { allSites.push(s); });\n});\nvar down = allSites.filter(function (s) { return s.error || !s.status || s.status >= 500; });\nvar sslSoon = allSites.filter(function (s) { return s.ssl_days != null && s.ssl_days < 30; });\nvar alerts = events.filter(function (e) { return e.kind === 'alert' || e.kind === 'down'; }).length;\nvar fixed = events.filter(function (e) { return e.kind === 'up' || e.kind === 'resolved'; }).length;\nvar L = [T.head + DateTime.now().setZone(TZ).toFormat(T.date), T.online(up, rows.length), ''];\nL = L.concat(lines);\nif (shops.length) { L.push(''); L = L.concat(shops); }\nif (allSites.length) {\n  L.push('');\n  L.push(T.sites(allSites.length - down.length, allSites.length));\n  down.forEach(function (s) { L.push('   🔴 ' + esc(s.host) + ': ' + esc(s.error || ('HTTP ' + s.status))); });\n  sslSoon.forEach(function (s) { L.push('   🔒 ' + esc(s.host) + T.ssl(s.ssl_days)); });\n}\nL.push('');\nL.push(T.day(alerts, fixed));\nevents.sort(function (a, b) { return b.ts - a.ts; }).slice(0, 8).forEach(function (e) {\n  var body = String(e.message || '').replace(/<[^>]+>/g, '').split(NL).slice(1).join(' / ');\n  L.push('   • ' + DateTime.fromMillis(Number(e.ts)).setZone(TZ).toFormat('HH:mm') + ' ' + esc(e.server) + ': ' + body.slice(0, 140).replace(/&[a-z]*$/, ''));\n});\nif (DASHBOARD_URL) { L.push(''); L.push('🔗 <a href=\"' + esc(DASHBOARD_URL) + '\">' + T.link + '</a>'); }\n// Telegram takes 4096 characters; drop whole lines so no HTML tag is cut in half.\nwhile (L.join(NL).length > 3900 && L.length > 3) L.splice(L.length - 2, 1);\nreturn [{ json: { message: L.join(NL) } }];\n"
+      },
+      "id": "37386786-f481-52b6-a3ec-5b686d40e1c5",
+      "name": "Build Daily Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        920
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_CHAT_ID",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "56459b8e-4a23-52e2-bd7d-6781647de667",
+      "name": "Send Daily Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        840
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "deleteRows",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_events"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "ts",
+              "condition": "lt",
+              "keyValue": "={{ Date.now() - 2592000000 }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "bec145e5-ba17-5eb3-b4f2-e7d877789a73",
+      "name": "Prune Events > 30 Days",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        1000
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "srvmon/sec/CHANGE-ME",
+        "options": {},
+        "responseMode": "onReceived"
+      },
+      "id": "647022c0-b3ac-511b-8fff-3baf26eb6dfc",
+      "name": "Security Report",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        1240
+      ],
+      "webhookId": "2079dfbb-4ed3-5d34-be4f-d50f1998dd1b"
+    },
+    {
+      "parameters": {
+        "jsCode": "// srvmon · Check Security Report\n// Each agent posts a summary of its last 24 hours once a day (srvmon-agent --security).\n// Keep it only if it comes from a known server and is a sane size; the digest is built later.\n\n// ---- settings ---------------------------------------------------------------------------\nvar KNOWN = ['web-1', 'web-2', 'erp-1', 'shop-1'];  // the same list as in Evaluate Report\n// -------------------------------------------------------------------------------------------\n\nvar body = $input.first().json.body || {};\nvar server = String(body.server || '').trim();\nif (KNOWN.indexOf(server) < 0 || body.kind !== 'security') return [];\nvar raw = JSON.stringify(body);\nif (raw.length > 300000) return [];\nreturn [{ json: { server: server, ts: Date.now(), report: raw } }];\n"
+      },
+      "id": "87b1331d-ae7c-582b-bd90-4b30e3983e9b",
+      "name": "Check Security Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        1240
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_security"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "server": "={{ $json.server }}",
+            "ts": "={{ $json.ts }}",
+            "report": "={{ $json.report }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "server",
+              "displayName": "server",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ts",
+              "displayName": "ts",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "report",
+              "displayName": "report",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f49fde28-e3bd-5d9f-8662-675cfc90721e",
+      "name": "Save Security Report",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        1240
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "10 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "1a988765-6f19-5843-a185-a2371daa1ffa",
+      "name": "Daily 9:10",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        1460
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_status"
+        },
+        "returnAll": true
+      },
+      "id": "eb594b57-4510-5c9c-860f-c66eef8d832c",
+      "name": "Load Status (Security)",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        1460
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_security"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "ts",
+              "condition": "gt",
+              "keyValue": "={{ Date.now() - 26 * 3600000 }}"
+            }
+          ]
+        },
+        "returnAll": true
+      },
+      "id": "e530480d-3798-54ec-80f5-8b24e254063d",
+      "name": "Load Security Reports",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        1460
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// srvmon · Build Security Digest\n// One Telegram message a day from every server's security summary: SSH attempts and logins,\n// fail2ban and Suricata, sudo, new listening ports, account changes, OOM kills, pending updates.\n// Servers with something worth a look come first; failed SSH logins on their own don't count,\n// they are the normal noise of a public server.\n\n// ---- settings ---------------------------------------------------------------------------\nvar LANG = 'en';  // 'en', or 'ar' for Egyptian Arabic\n// -------------------------------------------------------------------------------------------\n\nvar T = {\n  en: {\n    head: '🛡 <b>Security digest</b> · ', date: 'd MMM yyyy',\n    summary: function (n, w) { return n + ' server' + (n === 1 ? '' : 's') + ' reported' + (w ? ' · ' + w + ' need a look' : ' · nothing unusual ✅'); },\n    ssh: function (f, ips) { return f ? 'SSH: ' + f + ' failed logins from ' + ips + ' IP' + (ips === 1 ? '' : 's') : 'SSH: no failed logins'; },\n    logins: ' · logged in: ', f2b: function (n) { return 'fail2ban: ' + n + ' bans'; },\n    suri: function (a, p1) { return 'Suricata: ' + a + ' alerts' + (p1 ? ', ' + p1 + ' priority 1' : ''); },\n    sudo: function (n) { return 'sudo: ' + n + ' command' + (n === 1 ? '' : 's'); },\n    newPorts: '⚠️ New listening ports: ', closedPorts: 'Ports closed: ',\n    accounts: function (n) { return '⚠️ Account or group changes: ' + n; },\n    oom: function (n) { return '⚠️ Processes killed for lack of memory (OOM): ' + n; },\n    reboot: '⚠️ Reboot required', updates: function (n, s) { return (s ? '⚠️ ' : '') + 'Updates: ' + n + (s ? ' (' + s + ' security)' : ''); },\n    missing: '🚨 No security report from: '\n  },\n  ar: {\n    head: '🛡 <b>ملخص الأمان</b> · ', date: 'dd/MM/yyyy',\n    summary: function (n, w) { return 'وصل تقرير من ' + n + ' سيرفر' + (w ? ' · ' + w + ' محتاجين نظرة' : ' · مفيش حاجة غريبة ✅'); },\n    ssh: function (f, ips) { return f ? 'SSH: ' + f + ' محاولة دخول فاشلة من ' + ips + ' IP' : 'SSH: مفيش محاولات دخول فاشلة'; },\n    logins: ' · دخول: ', f2b: function (n) { return 'fail2ban: ' + n + ' حظر'; },\n    suri: function (a, p1) { return 'Suricata: ' + a + ' تنبيه' + (p1 ? '، منهم ' + p1 + ' أولوية 1' : ''); },\n    sudo: function (n) { return 'sudo: ' + n + ' أمر'; },\n    newPorts: '⚠️ بورتات جديدة مفتوحة: ', closedPorts: 'بورتات اتقفلت: ',\n    accounts: function (n) { return '⚠️ تغييرات في اليوزرات والجروبات: ' + n; },\n    oom: function (n) { return '⚠️ برامج اتقفلت عشان الرام خلصت (OOM): ' + n; },\n    reboot: '⚠️ محتاج restart', updates: function (n, s) { return (s ? '⚠️ ' : '') + 'تحديثات: ' + n + (s ? ' (' + s + ' أمنية)' : ''); },\n    missing: '🚨 مفيش تقرير أمان من: '\n  }\n}[LANG];\n\nvar NL = String.fromCharCode(10);\nfunction esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\nfunction sum(a) { return a.reduce(function (x, y) { return x + y; }, 0); }\n\n// The newest report per server.\nvar latest = {};\n$input.all().forEach(function (it) {\n  var r = it.json;\n  if (!r.server || !r.report) return;\n  if (!latest[r.server] || Number(r.ts) > Number(latest[r.server].ts)) latest[r.server] = r;\n});\nvar expected = $('Load Status (Security)').all().map(function (i) { return i.json.server; }).filter(Boolean);\n\nvar blocks = [];\nObject.keys(latest).sort().forEach(function (server) {\n  var p = {}; try { p = JSON.parse(latest[server].report); } catch (e) { return; }\n  var L = [], warn = 0;\n  var ssh = p.ssh || {};\n  var logins = (ssh.successful_logins || []).slice(0, 4).map(function (l) { return esc(l.user + '@' + l.ip) + (l.count > 1 ? ' ×' + l.count : ''); });\n  L.push(T.ssh(ssh.failed_attempts || 0, ssh.failed_unique_ips || 0) + (logins.length ? T.logins + logins.join(', ') : ''));\n  var sec = [];\n  if (p.fail2ban) sec.push(T.f2b(p.fail2ban.bans_24h || 0));\n  if (p.suricata) {\n    var p1 = sum((p.suricata.top_signatures || []).filter(function (s) { return s.priority === 1; }).map(function (s) { return s.count; }));\n    if (p1) warn++;\n    sec.push(T.suri(p.suricata.alerts_24h || 0, p1));\n  }\n  var sudo = sum((p.sudo_top || []).map(function (x) { return x[1]; }));\n  if (sudo) sec.push(T.sudo(sudo));\n  if (sec.length) L.push(sec.join(' · '));\n  var ports = p.ports || {};\n  if ((ports.new || []).length) { warn++; L.push(T.newPorts + esc(ports.new.join(', '))); }\n  if ((ports.closed || []).length) L.push(T.closedPorts + esc(ports.closed.join(', ')));\n  if ((p.account_changes || []).length) { warn++; L.push(T.accounts(p.account_changes.length)); }\n  if ((p.oom_kills || []).length) { warn++; L.push(T.oom(p.oom_kills.length)); }\n  if (p.reboot_required) { warn++; L.push(T.reboot + ((p.reboot_pkgs || []).length ? ' (' + esc(p.reboot_pkgs.slice(0, 3).join(', ')) + ')' : '')); }\n  if (p.security_updates_pending) warn++;\n  if (p.updates_pending) L.push(T.updates(p.updates_pending, p.security_updates_pending));\n  blocks.push({ server: server, warn: warn, text: (warn ? '🟠' : '🟢') + ' <b>' + esc(server) + '</b>' + NL + L.join(NL) });\n});\nblocks.sort(function (a, b) { return (b.warn ? 1 : 0) - (a.warn ? 1 : 0) || a.server.localeCompare(b.server); });\n\nvar missing = expected.filter(function (s) { return !latest[s]; }).sort();\nvar out = [T.head + DateTime.now().setZone($now.zoneName).toFormat(T.date),\n  T.summary(blocks.length, blocks.filter(function (b) { return b.warn; }).length)];\nif (missing.length) out.push(T.missing + esc(missing.join(', ')));\nblocks.forEach(function (b) { out.push(''); out.push(b.text); });\nvar text = out.join(NL);\n// Telegram takes 4096 characters; drop whole servers from the end (the quiet ones) until it fits.\nwhile (text.length > 3900 && blocks.length) { blocks.pop(); text = out.slice(0, missing.length ? 3 : 2).concat(blocks.map(function (b) { return NL + b.text; })).join(NL) + NL + '…'; }\nreturn [{ json: { message: text } }];\n"
+      },
+      "id": "00faf108-161b-550d-8b0b-f3e8ba082d7a",
+      "name": "Build Security Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        1460
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_CHAT_ID",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "cdcf68e3-535f-50fe-91c8-7ce344d4b8b4",
+      "name": "Send Security Digest",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        1380
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "deleteRows",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "srvmon_security"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "ts",
+              "condition": "lt",
+              "keyValue": "={{ Date.now() - 2592000000 }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "0f859d0d-b0e6-51b2-9a50-b003bd84f7d6",
+      "name": "Prune Security Reports > 30 Days",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        1540
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "content": "## srvmon · setup\n\n1. **Data tables** (Overview → Data tables), with these columns:\n   - `srvmon_status`: server (string), online (boolean), last_seen (number), payload (string), state (string)\n   - `srvmon_events`: server (string), kind (string), message (string), ts (number)\n   - `srvmon_security`: server (string), ts (number), report (string)\n2. **Webhook paths**: replace `CHANGE-ME` in *Agent Report* and *Security Report* with one long random token (`openssl rand -hex 16`), the same in both, and in *Dashboard Page* with a different one.\n3. **Dashboard login**: pick a Basic Auth credential in *Dashboard Page*.\n4. **Telegram**: pick your bot's credential and put your chat ID in the four Telegram nodes.\n5. **Settings** at the top of the Code nodes: `LANG` ('en' or 'ar'), `KNOWN` server names (Evaluate Report and Check Security Report), `SHOPS`, `DASHBOARD_URL`.\n6. Workflow settings: set the time zone; don't save successful executions (one per server per minute adds up).\n7. Activate, then install the agent on each server.",
+        "width": 520,
+        "height": 640,
+        "color": 4
+      },
+      "id": "7ea03d08-95ee-5bd2-ae4e-4b8cbcffe079",
+      "name": "Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -600,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "content": "**Alerts** go out only when something changes: a new problem, a problem resolved, a server silent or back. The logs the agent attached go as a reply under the alert. WhatsApp is off; to use it, fill in the Cloud API number and a header-auth credential (`Authorization: Bearer <token>`). Outside the 24-hour customer window WhatsApp only delivers approved templates.",
+        "width": 720,
+        "height": 160,
+        "color": 7
+      },
+      "id": "35889d08-1ed9-57c1-a048-cc176a1e7925",
+      "name": "Note: alerts",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1000,
+        -140
+      ]
+    }
+  ],
+  "connections": {
+    "Agent Report": {
+      "main": [
+        [
+          {
+            "node": "Load Previous State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Previous State": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Report": {
+      "main": [
+        [
+          {
+            "node": "Save Status",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Anything Changed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every Minute": {
+      "main": [
+        [
+          {
+            "node": "Load All Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load All Status": {
+      "main": [
+        [
+          {
+            "node": "Find Silent Servers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Silent Servers": {
+      "main": [
+        [
+          {
+            "node": "Save Status",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Anything Changed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything Changed?": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log Event",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send WhatsApp (optional)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Telegram Alert": {
+      "main": [
+        [
+          {
+            "node": "Has Logs?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Logs?": {
+      "main": [
+        [
+          {
+            "node": "Send Logs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dashboard Page": {
+      "main": [
+        [
+          {
+            "node": "Load Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Status": {
+      "main": [
+        [
+          {
+            "node": "Load Recent Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Recent Events": {
+      "main": [
+        [
+          {
+            "node": "Build Dashboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Dashboard": {
+      "main": [
+        [
+          {
+            "node": "Send Dashboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily 9 AM": {
+      "main": [
+        [
+          {
+            "node": "Load Status (Daily)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Status (Daily)": {
+      "main": [
+        [
+          {
+            "node": "Load Events 24h",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Events 24h": {
+      "main": [
+        [
+          {
+            "node": "Build Daily Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Daily Report": {
+      "main": [
+        [
+          {
+            "node": "Send Daily Report",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prune Events > 30 Days",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Security Report": {
+      "main": [
+        [
+          {
+            "node": "Check Security Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Security Report": {
+      "main": [
+        [
+          {
+            "node": "Save Security Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily 9:10": {
+      "main": [
+        [
+          {
+            "node": "Load Status (Security)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Status (Security)": {
+      "main": [
+        [
+          {
+            "node": "Load Security Reports",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Security Reports": {
+      "main": [
+        [
+          {
+            "node": "Build Security Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Security Digest": {
+      "main": [
+        [
+          {
+            "node": "Send Security Digest",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prune Security Reports > 30 Days",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

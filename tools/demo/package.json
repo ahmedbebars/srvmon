@@ -1,0 +1,7 @@
+{
+  "name": "srvmon-demo",
+  "private": true,
+  "description": "Runs the n8n Code nodes outside n8n on a made-up fleet: a test, and the source of the screenshots.",
+  "scripts": { "demo": "node run.js" },
+  "dependencies": { "luxon": "3.5.0" }
+}

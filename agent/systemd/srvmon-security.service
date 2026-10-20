@@ -1,0 +1,11 @@
+[Unit]
+Description=srvmon daily security summary (push to n8n)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/srvmon-agent --security /etc/srvmon/agent.json
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=300

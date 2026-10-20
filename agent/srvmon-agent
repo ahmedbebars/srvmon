@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+"""srvmon-agent: collect host metrics and push them to the n8n Server Monitor webhook.
+
+Usage:
+  srvmon-agent [config.json]              every minute: metrics (+ logs for anything broken)
+  srvmon-agent --security [config.json]   once a day: last-24h security summary
+Config (default /etc/srvmon/agent.json), see agent.example.json:
+  {"server": "web-1", "url": "https://n8n.example.com/webhook/srvmon/in/<token>",
+   "sites": [{"host": "example.com", "owner": "web-1"}]}
+Set "url" to "-" to print the payload instead of sending it.
+"""
+import concurrent.futures
+import glob
+import json
+import os
+import re
+import shlex
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+VERSION = "1.5"
+SKIP_SERVICES = re.compile(
+    r"^(systemd-|dbus|getty|serial-getty|user@|ssh|cron|rsyslog|polkit|udisks|unattended|"
+    r"multipathd|ModemManager|packagekit|irqbalance|snapd|qemu-guest|chrony|accounts-daemon|atd|"
+    r"blk|lvm2|open-vm|thermald|upower|wpa_supplicant|fwupd|containerd|setvbuf|kerneloops|rtkit|"
+    r"avahi|colord|NetworkManager|switcheroo|power-profiles|gdm|bolt|networkd-dispatcher|"
+    r"hv-kvp|cloud-|apport|plymouth)"
+)
+# Known-harmless failures (cloud-init-hotplugd fails on some cloud Ubuntu 24.04 images).
+IGNORE_FAILED = {"cloud-init-hotplugd.service"}
+REAL_FS = {"ext4", "ext3", "xfs", "btrfs", "zfs", "f2fs"}
+# Same thresholds as the n8n "Evaluate Report" node; logs are attached only when these trip.
+DISK_PCT, MEM_PCT, CPU_PCT = 85, 92, 95
+IPV4 = r"(\d{1,3}(?:\.\d{1,3}){3})"
+
+
+def sh(cmd, timeout=20):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def clip(text, limit=3000, line_len=300):
+    lines = [l[:line_len] for l in (text or "").splitlines()]
+    out = "\n".join(lines)
+    return out[-limit:]
+
+
+def state_dir():
+    d = "/var/lib/srvmon" if os.geteuid() == 0 else os.path.expanduser("~/.config/srvmon")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def cpu_pct():
+    def snap():
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        idle = v[3] + (v[4] if len(v) > 4 else 0)
+        return idle, sum(v)
+    i1, t1 = snap()
+    time.sleep(1)
+    i2, t2 = snap()
+    dt = t2 - t1
+    return round(100.0 * (1 - (i2 - i1) / dt), 1) if dt else 0.0
+
+
+def meminfo():
+    m = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            m[k] = int(v.split()[0])  # kB
+    total = m.get("MemTotal", 0)
+    avail = m.get("MemAvailable", m.get("MemFree", 0))
+    used = total - avail
+    swap_t = m.get("SwapTotal", 0)
+    swap_u = swap_t - m.get("SwapFree", 0)
+    gb = lambda kb: round(kb / 1048576, 1)
+    # Real memory pressure (PSI) = % of time tasks waited for RAM. A full swap on its own
+    # only means idle pages were parked there; pressure is what actually makes a server slow.
+    psi = {}
+    try:
+        with open("/proc/pressure/memory") as f:
+            for line in f:
+                kind, *kv = line.split()
+                d = dict(x.split("=", 1) for x in kv)
+                psi["psi_%s60" % kind] = float(d["avg60"])
+                psi["psi_%s300" % kind] = float(d["avg300"])
+    except (OSError, ValueError, KeyError):
+        pass
+    return {
+        "pct": round(100.0 * used / total, 1) if total else 0,
+        "used_gb": gb(used), "total_gb": gb(total),
+        "swap_pct": round(100.0 * swap_u / swap_t, 1) if swap_t else 0,
+        **psi,
+    }
+
+
+def disks():
+    out, seen = [], set()
+    with open("/proc/mounts") as f:
+        for line in f:
+            dev, mnt, fs = line.split()[:3]
+            if fs not in REAL_FS or dev in seen or mnt.startswith(("/snap", "/var/lib/docker", "/run")):
+                continue
+            seen.add(dev)
+            try:
+                s = os.statvfs(mnt)
+            except OSError:
+                continue
+            total = s.f_blocks * s.f_frsize
+            free = s.f_bavail * s.f_frsize
+            used = total - s.f_bfree * s.f_frsize
+            if total < 1 << 30:
+                continue
+            out.append({
+                "mount": mnt,
+                "pct": round(100.0 * used / (used + free), 1) if used + free else 0,
+                "used_gb": round(used / 2**30, 1), "total_gb": round(total / 2**30, 1),
+            })
+    return out
+
+
+def containers():
+    ids = sh("docker ps -aq 2>/dev/null")
+    if not ids:
+        return []
+    fmt = ("{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|"
+           "{{.HostConfig.RestartPolicy.Name}}|{{.State.ExitCode}}|{{.State.StartedAt}}|{{.Config.Image}}")
+    out = []
+    for line in sh("docker inspect --format '%s' %s" % (fmt, " ".join(ids.split())), timeout=30).splitlines():
+        p = line.split("|")
+        if len(p) < 7:
+            continue
+        out.append({
+            # Docker keeps the last health status after a container stops; only trust it while running.
+            "name": p[0].lstrip("/"), "status": p[1], "health": (p[2] or None) if p[1] == "running" else None,
+            "restart": p[3] or "no", "exit_code": int(p[4] or 0), "started": p[5][:19],
+            "image": p[6][:60],
+        })
+    return out
+
+
+def check_site(site):
+    host = site["host"]
+    res = {"host": host, "owner": site.get("owner"), "status": None, "ms": None, "ssl_days": None, "error": None}
+    t = time.time()
+    try:
+        req = urllib.request.Request("https://%s/" % host, headers={"User-Agent": "srvmon/" + VERSION})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            res["status"] = r.status
+    except urllib.error.HTTPError as e:
+        res["status"] = e.code
+    except Exception as e:
+        res["error"] = (getattr(e, "reason", None) and str(e.reason)) or str(e)
+        res["error"] = res["error"][:120]
+    res["ms"] = int((time.time() - t) * 1000)
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, 443), timeout=8) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                exp = ssl.cert_time_to_seconds(ss.getpeercert()["notAfter"])
+                res["ssl_days"] = int((exp - time.time()) // 86400)
+    except Exception:
+        pass
+    return res
+
+
+def disk_usage_report(mount):
+    """Biggest directories on a full disk; du is slow, so cache the answer for an hour."""
+    cache = os.path.join(tempfile.gettempdir(), "srvmon-du%s.txt" % mount.replace("/", "_"))
+    try:
+        if time.time() - os.path.getmtime(cache) < 3600:
+            with open(cache) as f:
+                return f.read()
+    except OSError:
+        pass
+    q = shlex.quote(mount)
+    text = "$ du -xh --max-depth=2 %s | sort -rh | head -20\n" % mount
+    text += sh("nice -n 19 ionice -c3 timeout 45 du -xh --max-depth=2 %s 2>/dev/null | sort -rh | head -20" % q, timeout=60)
+    dsd = sh("docker system df 2>/dev/null")
+    if dsd:
+        text += "\n\n$ docker system df\n" + dsd
+    text += "\n\n$ journalctl --disk-usage\n" + sh("journalctl --disk-usage 2>/dev/null")
+    try:
+        with open(cache, "w") as f:
+            f.write(text)
+    except OSError:
+        pass
+    return text
+
+
+def problem_logs(p):
+    """Evidence for each problem the n8n side will alert on, keyed like its alert keys."""
+    out = {}
+    for u in p["failed_units"]:
+        out["unit:" + u] = clip(
+            sh("systemctl status %s --no-pager -n 0 2>&1" % shlex.quote(u)) + "\n---\n"
+            + sh("journalctl -u %s -n 40 --no-pager -o short-iso 2>&1" % shlex.quote(u)))
+    for c in p["containers"]:
+        broken = (c["health"] == "unhealthy" or c["status"] == "restarting"
+                  or (c["status"] == "exited" and c["restart"] != "no"))
+        if not broken:
+            continue
+        n = shlex.quote(c["name"])
+        health = sh("docker inspect %s --format '{{if .State.Health}}{{range .State.Health.Log}}"
+                    "{{.ExitCode}}: {{.Output}}{{end}}{{end}}' 2>/dev/null" % n)
+        out["ctr:" + c["name"]] = clip(
+            "restart policy=%s exit_code=%s started=%s\n" % (c["restart"], c["exit_code"], c["started"])
+            + ("healthcheck:\n" + health[-800:] + "\n" if health else "")
+            + "--- docker logs --tail 40\n" + sh("docker logs --tail 40 %s 2>&1" % n))
+    for d in p["disks"]:
+        if d["pct"] >= DISK_PCT:
+            out["disk:" + d["mount"]] = clip(disk_usage_report(d["mount"]), 3500)
+    if p["mem"]["pct"] >= MEM_PCT:
+        out["mem"] = clip(sh("ps -eo pid,user,%mem,rss,etime,comm --sort=-%mem | head -12"))
+    if p["cpu_pct"] >= CPU_PCT:
+        out["cpu"] = clip(sh("ps -eo pid,user,%cpu,etime,comm --sort=-%cpu | head -12"))
+    return out
+
+
+# ---------------------------------------------------------------- daily security summary
+
+def journal(args, since):
+    return sh("journalctl %s --since '%s' --no-pager -o short-iso 2>/dev/null" % (args, since), timeout=90)
+
+
+def ssh_summary(since):
+    log = journal("-t sshd -t sshd-session", since)
+    fail_ip, fail_user = Counter(), Counter()
+    fail_re = re.compile(r"(?:Failed \S+ for (?:invalid user )?(\S+) from|Invalid user (\S+) from|"
+                         r"by (?:invalid|authenticating) user (\S+)) " + IPV4)
+    acc_re = re.compile(r"Accepted (\S+) for (\S+) from " + IPV4)
+    accepted = Counter()
+    for line in log.splitlines():
+        m = acc_re.search(line)
+        if m:
+            accepted[(m.group(2), m.group(3), m.group(1))] += 1
+            continue
+        m = fail_re.search(line)
+        if m:
+            fail_ip[m.group(4)] += 1
+            fail_user[m.group(1) or m.group(2) or m.group(3)] += 1
+    return {
+        "failed_attempts": sum(fail_ip.values()),
+        "failed_unique_ips": len(fail_ip),
+        "top_failed_ips": fail_ip.most_common(10),
+        "top_tried_users": fail_user.most_common(10),
+        "successful_logins": [{"user": u, "ip": ip, "method": m, "count": n}
+                              for (u, ip, m), n in accepted.most_common(20)],
+    }
+
+
+def fail2ban_summary(cutoff):
+    if not sh("command -v fail2ban-client"):
+        return None
+    jails = re.findall(r"Jail list:\s*(.*)", sh("fail2ban-client status"))
+    out = {"jails": {}}
+    for j in [x.strip() for x in (jails[0].split(",") if jails else []) if x.strip()]:
+        st = sh("fail2ban-client status %s" % shlex.quote(j))
+        cur = re.search(r"Currently banned:\s*(\d+)", st)
+        tot = re.search(r"Total banned:\s*(\d+)", st)
+        out["jails"][j] = {"currently_banned": int(cur.group(1)) if cur else None,
+                           "total_banned": int(tot.group(1)) if tot else None}
+    bans = Counter()
+    try:
+        cut = cutoff.strftime("%Y-%m-%d %H:%M")
+        with open("/var/log/fail2ban.log", errors="replace") as f:
+            for line in f:
+                if line[:16] >= cut and " Ban " in line:
+                    m = re.search(IPV4, line.split(" Ban ", 1)[1])
+                    if m:
+                        bans[m.group(1)] += 1
+    except OSError:
+        pass
+    out["bans_24h"] = sum(bans.values())
+    out["top_banned_ips"] = bans.most_common(10)
+    return out
+
+
+def suricata_summary(cutoff):
+    path = "/var/log/suricata/fast.log"
+    if not os.path.exists(path):
+        return None
+    sigs, srcs, prio1 = Counter(), Counter(), []
+    line_re = re.compile(r"^(\d\d/\d\d/\d{4}-\d\d:\d\d:\d\d)\.\d+\s+\[\*\*\] \[[\d:]+\] (.*?) \[\*\*\] "
+                         r"\[Classification: (.*?)\] \[Priority: (\d+)\] \{(\w+)\} (\S+) -> (\S+)")
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        if size > 80 * 2**20:  # only the tail of a huge log can be inside the last 24h
+            f.seek(size - 80 * 2**20)
+            f.readline()
+        for raw in f:
+            m = line_re.match(raw.decode("utf-8", "replace"))
+            if not m:
+                continue
+            try:
+                ts = datetime.strptime(m.group(1), "%m/%d/%Y-%H:%M:%S")
+            except ValueError:
+                continue
+            if ts < cutoff:
+                continue
+            sig, cls, prio, proto, src, dst = m.group(2), m.group(3), int(m.group(4)), m.group(5), m.group(6), m.group(7)
+            sigs[(sig, cls, prio)] += 1
+            srcs[src.rsplit(":", 1)[0]] += 1
+            if prio == 1 and len(prio1) < 15:
+                prio1.append("%s %s %s -> %s" % (m.group(1), sig, src, dst))
+    return {
+        "alerts_24h": sum(sigs.values()),
+        "top_signatures": [{"sig": s, "class": c, "priority": p, "count": n} for (s, c, p), n in sigs.most_common(15)],
+        "top_sources": srcs.most_common(10),
+        "priority1_samples": prio1,
+    }
+
+
+def listening_ports_diff():
+    now = sorted(set(re.sub(r"\s+", " ", l).split(" ")[3] for l in sh("ss -tlnH").splitlines() if l.strip()))
+    path = os.path.join(state_dir(), "ports.json")
+    try:
+        with open(path) as f:
+            before = json.load(f)
+    except (OSError, ValueError):
+        before = None
+    with open(path, "w") as f:
+        json.dump(now, f)
+    if before is None:
+        return {"listening": now, "first_run": True}
+    return {"listening": now, "new": sorted(set(now) - set(before)), "closed": sorted(set(before) - set(now))}
+
+
+def security_report(server):
+    since = "24 hours ago"
+    cutoff = datetime.now() - timedelta(hours=24)
+    sudo = journal("-t sudo", since)
+    sudo_cmds = Counter()
+    for line in sudo.splitlines():
+        m = re.search(r"sudo\[\d+\]:\s+(\S+) : .*COMMAND=(.*)", line)
+        if m:
+            sudo_cmds["%s: %s" % (m.group(1), m.group(2)[:150])] += 1
+    accounts = journal("-t useradd -t userdel -t usermod -t groupadd -t gpasswd -t passwd -t chpasswd", since)
+    oom = [l for l in journal("-k", since).splitlines() if "Killed process" in l or "Out of memory" in l]
+    upg = sh("apt list --upgradable 2>/dev/null | grep upgradable", timeout=60).splitlines()
+    return {
+        "server": server, "kind": "security", "agent": VERSION,
+        "ts": datetime.now(timezone.utc).isoformat(), "hostname": socket.gethostname(),
+        "ssh": ssh_summary(since),
+        "fail2ban": fail2ban_summary(cutoff),
+        "suricata": suricata_summary(cutoff),
+        "sudo_top": sudo_cmds.most_common(15),
+        "account_changes": [clip(l, 300) for l in accounts.splitlines()[-20:]],
+        "oom_kills": [clip(l, 300) for l in oom[-10:]],
+        "ports": listening_ports_diff(),
+        "updates_pending": len(upg),
+        "security_updates_pending": sum(1 for l in upg if "-security" in l),
+        "reboot_required": os.path.exists("/var/run/reboot-required"),
+        "reboot_pkgs": sh("cat /var/run/reboot-required.pkgs 2>/dev/null").split()[:15],
+    }
+
+
+# ---------------------------------------------------------------- site network (MikroTik + LAN devices)
+
+def read_env(path):
+    with open(path) as f:
+        return dict(l.strip().split("=", 1) for l in f if "=" in l and not l.startswith("#"))
+
+
+def mikrotik(rc):
+    """RouterOS snapshot over REST with a read-only user (a group with just `read,rest-api`).
+
+    One keep-alive TLS connection for all calls: TLS handshakes are what cost
+    CPU on small MIPS boards like the RB951.
+    """
+    import http.client
+    env = read_env(rc["env"])
+    host = env.get(rc.get("host_key", "ROUTER"), "192.168.88.1")
+    user, pw = env[rc.get("user_key", "WATCH_USER")], env[rc.get("pass_key", "WATCH_PASS")]
+    auth = "Basic " + __import__("base64").b64encode(("%s:%s" % (user, pw)).encode()).decode()
+    conn = http.client.HTTPSConnection(host, int(rc.get("port", 8443)), timeout=8,
+                                       context=ssl._create_unverified_context())
+
+    def get(path):
+        conn.request("GET", "/rest/" + path, headers={"Authorization": auth})
+        r = conn.getresponse()
+        body = r.read()
+        if r.status != 200:
+            raise RuntimeError("HTTP %s on %s" % (r.status, path.split("?")[0]))
+        return json.loads(body)
+
+    try:
+        res = get("system/resource?.proplist=board-name,version,uptime,cpu-load,free-memory,total-memory")
+        ifaces = {i["name"]: i for i in get("interface?.proplist=name,running,disabled,rx-byte,tx-byte")}
+        routes = get("ip/route?dst-address=0.0.0.0/0&.proplist=gateway,active,disabled,distance")
+        dhcp = len(get("ip/dhcp-server/lease?status=bound&.proplist=address"))
+        try:
+            hotspot = len(get("ip/hotspot/active?.proplist=user"))
+        except Exception:
+            hotspot = None
+        try:
+            wlan = len(get("interface/wireless/registration-table?.proplist=interface"))
+        except Exception:
+            wlan = None
+    finally:
+        conn.close()
+    return router_snapshot(rc, res, ifaces, routes, dhcp, hotspot, wlan)
+
+
+def router_snapshot(rc, res, ifaces, routes, dhcp, hotspot, wlan):
+    """Shared by the REST and SSH readers: rates, line state, payload shape."""
+    # Byte counters -> rates, using the previous sample kept on disk.
+    now = time.time()
+    path = os.path.join(state_dir(), "router.json")
+    try:
+        with open(path) as f:
+            prev = json.load(f)
+    except (OSError, ValueError):
+        prev = {}
+    with open(path, "w") as f:
+        json.dump({"t": now, "c": {n: [i.get("rx-byte"), i.get("tx-byte")] for n, i in ifaces.items()}}, f)
+    dt = now - prev.get("t", 0)
+
+    def rate(name):
+        old, cur = prev.get("c", {}).get(name), ifaces.get(name, {})
+        if not old or not (0 < dt < 600):
+            return None, None
+        try:
+            return (max(0, int(cur["rx-byte"]) - int(old[0])) * 8 // int(dt),
+                    max(0, int(cur["tx-byte"]) - int(old[1])) * 8 // int(dt))
+        except (KeyError, TypeError, ValueError):
+            return None, None
+
+    lines = []
+    for ln in rc["lines"]:
+        i = ifaces.get(ln["iface"], {})
+        running = i.get("running") == "true" and i.get("disabled") != "true"
+        # Same rule RouterOS uses for failover: the line is good when its default
+        # route (recursive via the probe IP, or the plain upstream gateway) is active.
+        gw = ln.get("probe") or ln.get("gateway")
+        route_up = any(r.get("gateway", "").split("%")[0] == gw and r.get("active") == "true"
+                       and r.get("disabled") != "true" for r in routes)
+        rx, tx = rate(ln["iface"])
+        lines.append({"id": ln["id"], "label": ln["label"], "iface": ln["iface"],
+                      "running": running, "up": running and route_up, "rx_bps": rx, "tx_bps": tx})
+    in_use = None
+    for r in sorted((r for r in routes if r.get("active") == "true"), key=lambda r: int(r.get("distance") or 99)):
+        in_use = next((ln["id"] for ln in rc["lines"]
+                       if (ln.get("probe") or ln.get("gateway")) == r.get("gateway", "").split("%")[0]), None)
+        if in_use:
+            break
+    tot, free = int(res.get("total-memory") or 0), int(res.get("free-memory") or 0)
+    return {
+        "model": res.get("board-name"), "version": res.get("version"),
+        "uptime_s": secs_ros(res.get("uptime", "")), "cpu_pct": int(res.get("cpu-load") or 0),
+        "mem_pct": round(100.0 * (tot - free) / tot, 1) if tot else None,
+        "lines": lines, "line_in_use": in_use,
+        "ports": [{"name": p, "running": ifaces.get(p, {}).get("running") == "true"} for p in rc.get("watch_ports", [])],
+        "dhcp_bound": dhcp, "hotspot_users": hotspot, "wlan_clients": wlan,
+    }
+
+
+def secs_ros(uptime):
+    """RouterOS uptime -> seconds. REST gives 1w2d3h4m5s; console :put gives 1w2d03:04:05."""
+    total, num = 0, ""
+    if ":" in uptime:
+        head, _, clock = uptime.rpartition("d") if "d" in uptime else ("", "", uptime)
+        if "w" in head:
+            w, _, head = head.partition("w")
+            total += int(w or 0) * 604800
+        total += int(head or 0) * 86400
+        h, m, s = (clock.split(":") + ["0", "0"])[:3]
+        return total + int(h) * 3600 + int(m) * 60 + int(s)
+    for ch in uptime:
+        if ch.isdigit():
+            num += ch
+        elif num:
+            total += int(num) * {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}.get(ch, 0)
+            num = ""
+    return total
+
+
+def mikrotik_ssh(rc):
+    """RouterOS snapshot over SSH, for routers where the REST API is not available.
+
+    Logs in as a key-only user whose group has just `ssh,read`, and runs one
+    console script that prints key=value lines.
+    """
+    script = (
+        ':put ("board=" . [/system resource get board-name]);'
+        ':put ("ver=" . [/system resource get version]);'
+        ':put ("uptime=" . [/system resource get uptime]);'
+        ':put ("cpu=" . [/system resource get cpu-load]);'
+        ':put ("mem=" . [/system resource get free-memory] . "/" . [/system resource get total-memory]);'
+        ':foreach i in=[/interface find] do={:put ("if=" . [/interface get $i name] . "|" . [/interface get $i running]'
+        ' . "|" . [/interface get $i disabled] . "|" . [/interface get $i rx-byte] . "|" . [/interface get $i tx-byte])};'
+        ':foreach r in=[/ip route find where dst-address=0.0.0.0/0] do={:put ("rt=" . [/ip route get $r gateway]'
+        ' . "|" . [/ip route get $r active] . "|" . [/ip route get $r disabled] . "|" . [/ip route get $r distance])};'
+        ':put ("dhcp=" . [/ip dhcp-server lease print count-only where status=bound])'
+    )
+    if rc.get("details"):
+        # Extra detail for a status page: firmware, temperature/voltage, who is
+        # connected (static leases are the shop's own devices) and every ethernet port.
+        script += (
+            ';:put ("fw=" . [/system routerboard get current-firmware] . "|" . [/system routerboard get upgrade-firmware]);'
+            ':foreach h in=[/system health find] do={:put ("h=" . [/system health get $h name] . "|" . [/system health get $h value])};'
+            ':foreach l in=[/ip dhcp-server lease find where status=bound] do={:put ("lease=" . [/ip dhcp-server lease get $l host-name]'
+            ' . "|" . [/ip dhcp-server lease get $l address] . "|" . [/ip dhcp-server lease get $l dynamic]'
+            ' . "|" . [/ip dhcp-server lease get $l comment])};'
+            ':foreach e in=[/interface ethernet find] do={:put ("eth=" . [/interface ethernet get $e name])}'
+        )
+    cmd = ["ssh", "-i", rc["key"], "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+           "-o", "StrictHostKeyChecking=accept-new", "-o", "UserKnownHostsFile=" + rc.get("known_hosts", "/etc/srvmon/router-known_hosts"),
+           "-o", "KexAlgorithms=+diffie-hellman-group14-sha1", "-o", "HostKeyAlgorithms=+ssh-rsa",
+           "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa", "%s@%s" % (rc["user"], rc["host"]), script]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0 or "board=" not in r.stdout:
+        raise RuntimeError((r.stderr or r.stdout or "ssh failed").strip().splitlines()[-1][:150])
+    kv, ifaces, routes = {}, {}, []
+    health, leases, eths = {}, [], []
+    for line in r.stdout.splitlines():
+        k, _, v = line.strip().partition("=")
+        if k == "h":
+            n, _, val = v.partition("|")
+            health[n] = val
+        elif k == "lease":
+            name, addr, dyn, comment = (v.split("|") + [""] * 4)[:4]
+            leases.append({"name": comment or name, "ip": addr, "fixed": dyn != "true"})
+        elif k == "eth":
+            eths.append(v)
+        elif k == "if":
+            n, run, dis, rx, tx = (v.split("|") + [""] * 5)[:5]
+            ifaces[n] = {"running": run, "disabled": dis, "rx-byte": rx, "tx-byte": tx}
+        elif k == "rt":
+            g, act, dis, dist = (v.split("|") + [""] * 4)[:4]
+            routes.append({"gateway": g, "active": act, "disabled": dis, "distance": dist})
+        elif k:
+            kv[k] = v
+    free, _, tot = kv.get("mem", "0/0").partition("/")
+    res = {"board-name": kv.get("board"), "version": kv.get("ver"), "uptime": kv.get("uptime", ""),
+           "cpu-load": kv.get("cpu"), "free-memory": free, "total-memory": tot}
+    dhcp = int(kv.get("dhcp") or 0)
+    snap = router_snapshot(rc, res, ifaces, routes, dhcp, None, None)
+    if rc.get("details"):
+        cur, _, up = kv.get("fw", "").partition("|")
+        snap["firmware"] = {"current": cur, "available": up}
+        snap["health"] = {k: v for k, v in health.items() if k in ("temperature", "voltage", "cpu-temperature")}
+        snap["leases"] = sorted(leases, key=lambda l: (not l["fixed"], l["name"] or "~"))[:120]
+        snap["eth"] = [{"name": e, "running": ifaces.get(e, {}).get("running") == "true"} for e in eths]
+    return snap
+
+
+def ping(ip):
+    """Three ICMP echoes; up if any of them answers."""
+    r = subprocess.run(["ping", "-c", "3", "-i", "0.3", "-W", "1", "-q", ip],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+def in_window(window, hm):
+    """Is hm ("HH:MM") inside a daily window like "01:00-11:30"? The window may wrap midnight."""
+    a, b = window.split("-")
+    return (a <= hm < b) if a <= b else (hm >= a or hm < b)
+
+
+def lan_devices(dc):
+    """Devices on a shop's LAN: printers, cameras, the NVR, a time clock, anything with an IP.
+
+    Each item is pinged (ICMP only, never the device's own port, so a time clock that
+    takes one connection at a time is never disturbed), unless it names a `state` file
+    that a watchdog of your own already keeps ({"up": true|false, "since": <epoch>}).
+    A pinged device counts as down only after `min_down_s` of failed pings, so one lost
+    packet doesn't wake anybody up.
+
+      "devices": {"min_down_s": 180, "tz": "Europe/Berlin", "items": [
+        {"group": "printer", "id": "kitchen", "name": "Kitchen printer", "ip": "192.168.88.50"},
+        {"group": "printer", "id": "bar", "name": "Bar printer", "ip": "192.168.88.51", "quiet": "01:00-11:30"},
+        {"group": "printer", "id": "terrace", "name": "Terrace printer", "off": true},
+        {"group": "clock", "id": "clock", "name": "Time clock", "state": "/var/lib/clock-watch.json"}]}
+
+    quiet: a daily window when the device is switched off on purpose (shown with 💤, never alerted).
+    off:   switched off until further notice (shown with ⏸, never alerted).
+    """
+    items = dc.get("items") or []
+    now = time.time()
+    hm = datetime.now(ZoneInfo(dc["tz"]) if dc.get("tz") else None).strftime("%H:%M")
+    min_down = int(dc.get("min_down_s", 180))
+    path = os.path.join(state_dir(), "devices.json")
+    try:
+        with open(path) as f:
+            failing = json.load(f)  # id -> time of the first failed ping in the current run of failures
+    except (OSError, ValueError):
+        failing = {}
+
+    # A state file wins when there is one; anything else with an IP is pinged, all at once.
+    known = {}
+    for n, d in enumerate(items):
+        if d.get("off") or not d.get("state"):
+            continue
+        try:
+            with open(d["state"]) as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(s, dict):
+            up = bool(s["up"]) if "up" in s else not s.get("down", False)
+            known[n] = (up, None if up else s.get("since"))
+    ips = sorted({d["ip"] for n, d in enumerate(items) if n not in known and not d.get("off") and d.get("ip")})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        answered = dict(zip(ips, pool.map(ping, ips)))
+
+    out, still_failing = [], {}
+    for n, d in enumerate(items):
+        key = str(d.get("id") or d.get("ip") or d.get("name"))
+        dev = {"group": d.get("group") or "other", "id": key, "name": d.get("name") or key}
+        if d.get("off"):
+            out.append(dict(dev, name=dev["name"] + " ⏸", up=True, off=True))
+            continue
+        if n in known:
+            up, since = known[n]
+        elif d.get("ip") in answered:
+            up, since = answered[d["ip"]], None
+            if not up:
+                since = still_failing[key] = failing.get(key, now)
+                up = now - since < min_down
+                since = None if up else since
+        else:
+            continue  # no state file yet and nothing to ping
+        if not up and d.get("quiet") and in_window(d["quiet"], hm):
+            out.append(dict(dev, name=dev["name"] + " 💤", up=True, quiet=True))
+            continue
+        out.append(dict(dev, up=up, since=since))
+    try:
+        with open(path, "w") as f:
+            json.dump(still_failing, f)
+    except OSError:
+        pass
+    return out
+
+
+def backup_ages(specs):
+    """Age of the newest file or folder matching each backup glob. A backup job that stops
+    silently (one Odoo backup here had failed for three months before anyone noticed) shows up
+    here as a growing age; n8n alerts once it passes max_age_h.
+    Config: "backups": [{"label": "Odoo", "path": "/opt/backups/odoo/20*", "max_age_h": 30}]"""
+    now = time.time()
+    out = []
+    for b in specs:
+        newest, n = None, 0
+        for path in glob.glob(b["path"]):
+            try:
+                m = os.path.getmtime(path)
+            except OSError:
+                continue
+            n += 1
+            newest = m if newest is None or m > newest else newest
+        out.append({"label": b["label"], "max_age_h": b.get("max_age_h", 30), "count": n,
+                    "age_h": round((now - newest) / 3600, 1) if newest is not None else None})
+    return out
+
+
+# ---------------------------------------------------------------- main
+
+def collect(conf):
+    # Sample CPU before the site checks start, so they don't inflate it.
+    cpu = cpu_pct()
+    sites = conf.get("sites") or []
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=12)
+    site_futs = [pool.submit(check_site, s) for s in sites]
+
+    osr = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.rstrip().split("=", 1)
+                    osr[k] = v.strip('"')
+    except OSError:
+        pass
+    with open("/proc/uptime") as f:
+        uptime_s = float(f.read().split()[0])
+
+    running = sh("systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null")
+    services = [l.split()[0].replace(".service", "") for l in running.splitlines() if l.strip()]
+    failed = sh("systemctl list-units --state=failed --no-legend --plain 2>/dev/null")
+
+    payload = {
+        "server": conf["server"],
+        "agent": VERSION,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "hostname": socket.gethostname(),
+        "os": osr.get("PRETTY_NAME", ""),
+        "kernel": os.uname().release,
+        "ncpu": os.cpu_count(),
+        "uptime_h": round(uptime_s / 3600, 1),
+        "cpu_pct": cpu,
+        "load": [round(x, 2) for x in os.getloadavg()],
+        "mem": meminfo(),
+        "disks": disks(),
+        "services_running": len(services),
+        "services": sorted(s for s in services if not SKIP_SERVICES.match(s)),
+        "failed_units": [u for u in (l.split()[0] for l in failed.splitlines() if l.strip())
+                         if u not in IGNORE_FAILED],
+        "containers": containers(),
+    }
+    payload["problem_logs"] = problem_logs(payload)
+    if conf.get("router"):
+        try:
+            rc = conf["router"]
+            payload["router"] = mikrotik_ssh(rc) if rc.get("via") == "ssh" else mikrotik(rc)
+        except Exception as e:
+            payload["router"] = {"error": str(e)[:150]}
+    if conf.get("devices"):
+        payload["devices"] = lan_devices(conf["devices"])
+    if conf.get("backups"):
+        payload["backups"] = backup_ages(conf["backups"])
+    payload["sites"] = [f.result() for f in site_futs]
+    pool.shutdown()
+    return payload
+
+
+def push(url, payload):
+    data = json.dumps(payload).encode()
+    if url == "-":
+        print(json.dumps(payload, indent=1))
+        return 0
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": "srvmon-agent/" + VERSION})
+    err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                r.read()
+            return 0
+        except Exception as e:
+            err = e
+            time.sleep(3)
+    print("srvmon: push failed: %s" % err, file=sys.stderr)
+    return 1
+
+
+def main():
+    args = sys.argv[1:]
+    security = "--security" in args
+    args = [a for a in args if a != "--security"]
+    path = args[0] if args else "/etc/srvmon/agent.json"
+    with open(path) as f:
+        conf = json.load(f)
+    if security:
+        url = conf.get("security_url") or (conf["url"] if conf["url"] == "-"
+                                           else conf["url"].replace("/srvmon/in/", "/srvmon/sec/"))
+        return push(url, security_report(conf["server"]))
+    return push(conf["url"], collect(conf))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

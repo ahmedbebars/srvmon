@@ -1,0 +1,38 @@
+{
+  "server": "shop-1",
+  "url": "https://n8n.example.com/webhook/srvmon/in/CHANGE-ME",
+
+  "sites": [
+    {"host": "example.com", "owner": "web-1"},
+    {"host": "www.example.com", "owner": "web-1"},
+    {"host": "erp.example.net", "owner": "erp-1"}
+  ],
+
+  "backups": [
+    {"label": "Odoo", "path": "/opt/backups/odoo/20*", "max_age_h": 30},
+    {"label": "Postgres", "path": "/var/backups/postgres/*.dump", "max_age_h": 30}
+  ],
+
+  "router": {
+    "env": "/etc/srvmon/router.env",
+    "lines": [
+      {"id": "line1", "label": "Fibre", "iface": "ether1", "probe": "9.9.9.9"},
+      {"id": "line2", "label": "LTE backup", "iface": "lte1", "probe": "1.1.1.1"}
+    ],
+    "watch_ports": ["ether2", "ether3"]
+  },
+
+  "devices": {
+    "tz": "Europe/Berlin",
+    "min_down_s": 180,
+    "items": [
+      {"group": "printer", "id": "kitchen", "name": "Kitchen printer", "ip": "192.168.88.50"},
+      {"group": "printer", "id": "bar", "name": "Bar printer", "ip": "192.168.88.51", "quiet": "01:00-11:30"},
+      {"group": "printer", "id": "terrace", "name": "Terrace printer", "off": true},
+      {"group": "nvr", "id": "nvr", "name": "NVR", "ip": "192.168.88.20"},
+      {"group": "camera", "id": "cam1", "name": "Cam 1", "ip": "192.168.88.21"},
+      {"group": "camera", "id": "cam2", "name": "Cam 2", "ip": "192.168.88.22"},
+      {"group": "clock", "id": "clock", "name": "Time clock", "ip": "192.168.88.30"}
+    ]
+  }
+}
